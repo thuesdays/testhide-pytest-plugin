@@ -2,32 +2,15 @@
 
 __author__ = 'thuesdays@gmail.com'
 
-import sys
 import socket
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import pytest
-from pytest import hookspec
 
+from . import hookspecs
 
-# --- Custom Hooks Specifications ---
-@hookspec
-def pytest_testhide_add_session_properties(plugin):
-    """
-    Hook for adding session-level metadata properties to the report.
-    These are added at the end of the <testsuites> block.
-    Should return a list of (name, value) tuples.
-    """
-
-
-@hookspec
-def pytest_testhide_get_test_case_properties(item, report) -> list:
-    """
-    Hook for getting per-test-case properties (docstr, info, attachments).
-    These are added inside the <testcase>'s own <properties> block.
-    Should return a list of (name, value) tuples.
-    """
+plugin_instance = None
 
 
 class TesthidePlugin:
@@ -56,15 +39,29 @@ class TesthidePlugin:
     # --- Pytest Hooks Implementation ---
     
     def pytest_sessionstart(self, session):
-        """Initializes the main report structure at the start."""
+        """
+        Initializes the report, collects session metadata via hooks,
+        and writes the initial report file immediately.
+        """
         self.xml_report_root = ET.Element('testsuites')
         self.xml_main_testsuite = ET.SubElement(
             self.xml_report_root, 'testsuite',
-            name='pytest',  # As per example
+            name='pytest',
             timestamp=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
             hostname=socket.gethostname()
         )
-        # Session properties are now added at the end in pytest_sessionfinish
+        
+        properties_element = ET.SubElement(self.xml_main_testsuite, 'properties')
+        ET.SubElement(properties_element, 'property', name='ip_address',
+                      value=socket.gethostbyname(socket.gethostname()))
+        ET.SubElement(properties_element, 'property', name='hostname', value=socket.gethostname())
+        
+        all_metadata_lists = self.config.hook.pytest_testhide_add_metadata(plugin=self)
+        for metadata_list in all_metadata_lists:
+            for name, value in metadata_list:
+                ET.SubElement(properties_element, 'property', name=str(name), value=str(value))
+        
+        self._write_xml_report()
     
     def pytest_runtest_logreport(self, report):
         """Captures the test result object."""
@@ -131,23 +128,6 @@ class TesthidePlugin:
     
     def pytest_sessionfinish(self, session):
         """Adds final session properties and performs the final write."""
-        
-        # --- Add mandatory properties ---
-        session_properties = [
-            ('ip_address', socket.gethostbyname(socket.gethostname())),
-            ('hostname', socket.gethostname())
-        ]
-        
-        # --- Call custom hook to get user-defined session properties ---
-        all_user_properties = self.config.hook.pytest_testhide_add_session_properties(plugin=self)
-        for prop_list in all_user_properties:
-            session_properties.extend(prop_list)
-        
-        # Create the final <properties> block under <testsuites>
-        properties_element = ET.SubElement(self.xml_report_root, 'properties')
-        for name, value in session_properties:
-            ET.SubElement(properties_element, 'property', name=str(name), value=str(value))
-        
         # Perform the final write
         self._update_suite_summary_and_write()
 
@@ -159,16 +139,34 @@ def pytest_addoption(parser):
                     help='Enable incremental XML reporting to the specified file.')
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
-    config.pluginmanager.add_hookspecs(sys.modules[__name__])
+    global plugin_instance
+    config.pluginmanager.add_hookspecs(hookspecs)
     if config.option.report_xml:
-        plugin = TesthidePlugin(config)
-        config._testhide_plugin = plugin
-        config.pluginmanager.register(plugin, "testhide_plugin")
+        plugin_instance = TesthidePlugin(config)
 
 
 def pytest_unconfigure(config):
-    plugin = getattr(config, '_testhide_plugin', None)
-    if plugin:
-        del config._testhide_plugin
-        config.pluginmanager.unregister(plugin)
+    global plugin_instance
+    plugin_instance = None
+
+
+def pytest_sessionstart(session):
+    if plugin_instance:
+        plugin_instance.pytest_sessionstart(session)
+
+
+def pytest_runtest_logreport(report):
+    if plugin_instance:
+        plugin_instance.pytest_runtest_logreport(report)
+
+
+def pytest_runtest_teardown(item):
+    if plugin_instance:
+        plugin_instance.pytest_runtest_teardown(item)
+
+
+def pytest_sessionfinish(session):
+    if plugin_instance:
+        plugin_instance.pytest_sessionfinish(session)
