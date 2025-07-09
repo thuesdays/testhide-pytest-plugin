@@ -1,0 +1,32 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testhide-pytest-plugin"
+version = "0.1.0"
+authors = [
+  { name="Mykola Kovhanko", email="thuesdays@gmail.com" },
+]
+description = "A pytest plugin for creating incremental XML test reports for Testhide system."
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Framework :: Pytest",
+]
+dependencies = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/thuesdays/testhide-pytest-plugin"
+"Bug Tracker" = "https://github.com/thuesdays/testhide-pytest-plugin/issues"
+
+[project.entry-points."pytest11"]
+testhide_plugin = "testhide_plugin.plugin"
