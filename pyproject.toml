@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "testhide-pytest-plugin"
-version = "0.1.7"
+version = "0.1.8"
 authors = [
   { name="Mykola Kovhanko", email="thuesdays@gmail.com" },
 ]
