@@ -37,7 +37,10 @@ pytest --reruns 5 --report-xml=junittests.xml
 ```
 
 ## JIRA Integration
-To enable JIRA integration, simply provide the connection details as command-line options. Integration is enabled automatically when all three parameters are present.
+The plugin can automatically enrich failure reports with information from JIRA, linking test failures to known bugs and their statuses. There are two ways to configure this integration.
+
+### Method 1: Command-Line Arguments
+You can enable JIRA integration by providing the connection details as command-line options. The integration is activated automatically when all three parameters are present.
 
 * **--jira-url**: The URL of your JIRA instance.
 * **--jira-username**: The username for the connection.
@@ -47,6 +50,24 @@ pytest --report-xml=junittests.xml \
        --jira-url="[https://jira.yourcompany.com](https://jira.yourcompany.com)" \
        --jira-username="my-bot" \
        --jira-password="your-api-token"
+```
+
+### Method 2: Programmatic Configuration (for Frameworks)
+If you are developing a test framework plugin and manage credentials in a central configuration object (e.g., a YAML file), you can programmatically set the JIRA options. This avoids exposing credentials in CI scripts.
+Use the `pytest_cmdline_main` hook in your own plugin to set the configuration options before the `testhide-plugin` is configured.
+```python
+import pytest
+
+class MyFrameworkPlugin:
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_cmdline_main(self, config):
+        # Assuming ConfigApp loads your central configuration
+        # from a file or environment variables.
+        from my_framework.config import ConfigApp
+        
+        config.option.jira_url = ConfigApp.jira.url
+        config.option.jira_username = ConfigApp.jira.username
+        config.option.jira_password = ConfigApp.jira.password
 ```
 
 ## Extending the Plugin (For Framework Developers)
