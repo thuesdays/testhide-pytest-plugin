@@ -69,7 +69,8 @@ class TesthidePlugin:
         self.is_xdist_master = not hasattr(config, "workerinput")
         self.is_xdist_run = config.option.dist != "no"
         self.rerun_counters = {}
-
+        self.test_reports = {}
+        
         self.jira_enabled = all([
             config.option.jira_url,
             config.option.jira_username,
@@ -155,93 +156,89 @@ class TesthidePlugin:
         else:
             return summary
     
-    def pytest_runtest_logreport(self, report):
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item, call):
         """
-        Captures the final report of a test and immediately writes it to a temp file.
-        This approach is stateless and robust against reruns and parallel execution.
+        This wrapper hook intercepts the report after it is created and attaches it to the 'item'
+        object itself. This is more reliable than storing the state in a plugin.
         """
-        if self.is_xdist_master and self.is_xdist_run:
+        outcome = yield
+        report = outcome.get_result()
+        
+        if report.when in ('setup', 'call') and getattr(report, 'outcome', '') != 'rerun':
+            item._final_report = report
+    
+    @pytest.hookimpl(trylast=True)
+    def pytest_runtest_teardown(self, item):
+        """
+        Runs last, after all other teardowns.
+        Takes the final report attached to 'item' and writes XML.
+        """
+        report = getattr(item, '_final_report', None)
+        if not report:
             return
         
-        if hasattr(report, "outcome") and report.outcome == "rerun":
-            return
+        filepath, line, name = report.location
+        classname_path = report.nodeid.split('::')
+        if len(classname_path) > 2:
+            classname = ".".join(classname_path[:-1]).replace('/', '.')
+        else:
+            classname = os.path.splitext(os.path.basename(filepath))[0]
         
-        is_terminal_report = report.when == 'call' or (report.when == 'setup' and not report.passed)
-        if not is_terminal_report:
-            return
-
-        safe_nodeid = re.sub(r'[^A-Za-z0-9_.\[\]-]', '_', report.nodeid)
-        report_fname = os.path.join(self.temp_dir, f"{safe_nodeid}.xml")
-        lock_fname = os.path.join(self.temp_dir, f"{safe_nodeid}.lock")
+        testcase_attrs = {
+            'classname': classname, 'name': name, 'file': str(filepath),
+            'line': str(line), 'time': f"{report.duration:.3f}"
+        }
+        testcase = ET.Element('testcase', **testcase_attrs)
         
-        # Use a file lock to ensure that only one process writes the report at a time.
-        # The last process to write wins, which is the desired behavior for reruns.
-        with FileLock(lock_fname):
-            filepath, line, name = report.location
-            classname_path = report.nodeid.split('::')
-            if len(classname_path) > 2:
-                classname = ".".join(classname_path[:-1]).replace('/', '.')
-            else:
-                classname = os.path.splitext(os.path.basename(filepath))[0]
+        if report.failed:
+            tag = 'error' if report.when == 'setup' else 'failure'
+            failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr, 'reprcrash') else str(
+                report.longrepr)
             
-            testcase_attrs = {
-                'classname': classname,
-                'name': name,
-                'file': str(filepath),
-                'line': str(line),
-                'time': f"{report.duration:.3f}"
-            }
-            testcase = ET.Element('testcase', **testcase_attrs)
+            if self.jira_enabled:
+                try:
+                    sub = re.sub(r'\[.+\]$', '', name)
+                    fail_id_str = f"{classname}.{sub}.{failure_message}"
+                    fail_id = md5(fail_id_str.encode('utf-8')).hexdigest()
+                    
+                    issue = self._get_issue_by_test_id(fail_id)
+                    if issue:
+                        issue_text = issue.fields.summary;
+                        issue_type = issue.fields.issuetype.name;
+                        issue_id = issue.permalink()
+                        status_name = issue.fields.status.name;
+                        test_resolution = 'Known issue'
+                        if status_name in ('Verified', 'Closed'):
+                            test_resolution = 'Need to reopen'
+                        elif status_name in ('Resolved', 'In Testing'):
+                            test_resolution = 'Resolved in branch'
+                        failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
+                    else:
+                        failure_message += f"@@testid#{fail_id}"
+                except Exception as e:
+                    self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
             
-            if report.failed:
-                tag = 'error' if report.when == 'setup' else 'failure'
-                failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr,
-                                                                                    'reprcrash') else str(
-                    report.longrepr)
-                
-                if self.jira_enabled:
-                    try:
-                        sub = re.sub(r'\[.+\]$', '', name)
-                        fail_id_str = f"{classname}.{sub}.{failure_message}"
-                        fail_id = md5(fail_id_str.encode('utf-8')).hexdigest()
-                        
-                        issue = self._get_issue_by_test_id(fail_id)
-                        if issue:
-                            issue_text = issue.fields.summary
-                            issue_type = issue.fields.issuetype.name
-                            issue_id = issue.permalink()
-                            status_name = issue.fields.status.name
-                            test_resolution = 'Known issue'
-                            if status_name in ('Verified', 'Closed'):
-                                test_resolution = 'Need to reopen'
-                            elif status_name in ('Resolved', 'In Testing'):
-                                test_resolution = 'Resolved in branch'
-                            failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
-                        else:
-                            failure_message += f"@@testid#{fail_id}"
-                    except Exception as e:
-                        self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
-                
-                failure_element = ET.SubElement(testcase, tag, message=failure_message)
-                failure_element.text = self._get_cleaned_traceback(report)
-            
-            elif report.skipped:
-                skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
-                ET.SubElement(testcase, 'skipped',
-                              **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
-            
-            item = next((i for i in self.session.items if i.nodeid == report.nodeid), None)
-            # Make sure item is not None before trying to get properties
-            if item:
-                all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
-                flat_properties = [prop for sublist in all_properties for prop in sublist]
-                if flat_properties:
-                    properties_element = ET.SubElement(testcase, 'properties')
-                    for prop_name, prop_value in flat_properties:
-                        ET.SubElement(properties_element, 'property', name=str(prop_name), value=str(prop_value))
-            
-            # Atomically write the report file, overwriting any previous result for this test.
-            ET.ElementTree(testcase).write(report_fname, encoding='utf-8', xml_declaration=True)
+            failure_element = ET.SubElement(testcase, tag, message=failure_message)
+            failure_element.text = self._get_cleaned_traceback(report)
+        
+        elif report.skipped:
+            skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
+            ET.SubElement(testcase, 'skipped',
+                          **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
+        
+        all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
+        flat_properties = [prop for sublist in all_properties for prop in sublist]
+        if flat_properties:
+            properties_element = ET.SubElement(testcase, 'properties')
+            for prop_name, prop_value in flat_properties:
+                ET.SubElement(properties_element, 'property', name=str(prop_name), value=str(prop_value))
+        
+        safe_nodeid = re.sub(r'[^A-Za-z0-9_.\[\]-]', '_', item.nodeid)
+        worker = getattr(self.config, 'workerinput', {}).get('workerid', 'master')
+        fname = os.path.join(self.temp_dir, f"{safe_nodeid}_{worker}.xml")
+        
+        ET.ElementTree(testcase).write(fname, encoding='utf-8', xml_declaration=True)
     
     def pytest_sessionstart(self, session):
         """
@@ -348,10 +345,10 @@ def pytest_configure(config):
     
     if not config.option.report_xml:
         return
-
+    
     base_name = "testhide_plugin"
-
+    
     if config.pluginmanager.has_plugin(base_name + "_active"):
         return
-
+    
     config.pluginmanager.register(TesthidePlugin(config), base_name + "_active")
