@@ -3,13 +3,16 @@
 __author__ = 'thuesdays@gmail.com'
 
 import os
-import sys
+import signal
 import time
 import socket
 import shutil
+import re
+from hashlib import md5
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
+import pluggy
 import pytest
 from . import hookspecs
 
@@ -53,18 +56,67 @@ class FileLock:
 
 class TesthidePlugin:
     """
-    A pytest plugin that provides robust, incremental XML reporting.
-    It uses file-locking for single-process runs and a temporary directory
-    merge strategy for parallel runs with pytest-xdist.
+    A pytest plugin that provides robust, incremental XML reporting with optional JIRA integration.
+    It uses a universal temporary directory and merge strategy for all execution modes,
+    ensuring full compatibility with pytest-xdist and pytest-rerunfailures.
     """
     
     def __init__(self, config):
         self.config = config
+        self.session = None
         self.report_xml_path = config.option.report_xml
-        self.lock_path = self.report_xml_path + ".lock"
-        self.temp_dir = f".{os.path.basename(self.report_xml_path)}_temp"
-        self.is_xdist_worker = hasattr(config, "workerinput")
-        self.test_reports = {}
+        self.temp_dir = os.path.join(str(config.rootdir), f".{os.path.basename(self.report_xml_path)}_temp")
+        self.is_xdist_master = not hasattr(config, "workerinput")
+        self.is_xdist_run = config.option.dist != "no"
+        self.rerun_counters = {}
+
+        self.jira_enabled = all([
+            config.option.jira_url,
+            config.option.jira_username,
+            config.option.jira_password
+        ])
+        self.jira = None
+        self._merged = False
+        
+        if self.is_xdist_master:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, self._signal_flush)
+    
+    def _init_jira_helper(self):
+        """
+        Initializes the JIRA connection.
+        """
+        if not self.jira_enabled:
+            return
+        
+        from jira import JIRA  # Lazy import to avoid dependency if not used
+        
+        for _ in range(3):  # Retry connection
+            try:
+                self.jira = JIRA(
+                    self.config.option.jira_url,
+                    basic_auth=(self.config.option.jira_username, self.config.option.jira_password)
+                )
+                return  # Success
+            except Exception as e:
+                self.config.warn('JIRA_CONNECTION_ERROR', f"JIRA connection attempt failed: {e}")
+                time.sleep(3)
+        
+        self.config.warn('JIRA_CONNECTION_FAILED', "Could not establish JIRA connection after multiple retries.")
+        self.jira_enabled = False  # Disable if connection failed
+    
+    def _get_issue_by_test_id(self, test_id: str):
+        """
+        Gets a JIRA issue by a unique test failure ID.
+        """
+        if not self.jira:
+            return None
+        try:
+            issues = self.jira.search_issues(f'description ~ "testid#{test_id}" ORDER BY updated')
+            return issues[0] if issues else None
+        except Exception as e:
+            self.config.warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for testid#{test_id}: {e}")
+            return None
     
     def _get_cleaned_traceback(self, report):
         """
@@ -105,199 +157,201 @@ class TesthidePlugin:
     
     def pytest_runtest_logreport(self, report):
         """
-        Captures the test report for each phase and stores it in a dictionary,
-        keyed by the test's unique nodeid.
+        Captures the final report of a test and immediately writes it to a temp file.
+        This approach is stateless and robust against reruns and parallel execution.
         """
-        if report.when == 'call' or (report.when == 'setup' and report.failed):
-            self.test_reports[report.nodeid] = report
+        if self.is_xdist_master and self.is_xdist_run:
+            return
+        
+        if hasattr(report, "outcome") and report.outcome == "rerun":
+            return
+        
+        is_terminal_report = report.when == 'call' or (report.when == 'setup' and not report.passed)
+        if not is_terminal_report:
+            return
+
+        safe_nodeid = re.sub(r'[^A-Za-z0-9_.\[\]-]', '_', report.nodeid)
+        report_fname = os.path.join(self.temp_dir, f"{safe_nodeid}.xml")
+        lock_fname = os.path.join(self.temp_dir, f"{safe_nodeid}.lock")
+        
+        # Use a file lock to ensure that only one process writes the report at a time.
+        # The last process to write wins, which is the desired behavior for reruns.
+        with FileLock(lock_fname):
+            filepath, line, name = report.location
+            classname_path = report.nodeid.split('::')
+            if len(classname_path) > 2:
+                classname = ".".join(classname_path[:-1]).replace('/', '.')
+            else:
+                classname = os.path.splitext(os.path.basename(filepath))[0]
+            
+            testcase_attrs = {
+                'classname': classname,
+                'name': name,
+                'file': str(filepath),
+                'line': str(line),
+                'time': f"{report.duration:.3f}"
+            }
+            testcase = ET.Element('testcase', **testcase_attrs)
+            
+            if report.failed:
+                tag = 'error' if report.when == 'setup' else 'failure'
+                failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr,
+                                                                                    'reprcrash') else str(
+                    report.longrepr)
+                
+                if self.jira_enabled:
+                    try:
+                        sub = re.sub(r'\[.+\]$', '', name)
+                        fail_id_str = f"{classname}.{sub}.{failure_message}"
+                        fail_id = md5(fail_id_str.encode('utf-8')).hexdigest()
+                        
+                        issue = self._get_issue_by_test_id(fail_id)
+                        if issue:
+                            issue_text = issue.fields.summary
+                            issue_type = issue.fields.issuetype.name
+                            issue_id = issue.permalink()
+                            status_name = issue.fields.status.name
+                            test_resolution = 'Known issue'
+                            if status_name in ('Verified', 'Closed'):
+                                test_resolution = 'Need to reopen'
+                            elif status_name in ('Resolved', 'In Testing'):
+                                test_resolution = 'Resolved in branch'
+                            failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
+                        else:
+                            failure_message += f"@@testid#{fail_id}"
+                    except Exception as e:
+                        self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
+                
+                failure_element = ET.SubElement(testcase, tag, message=failure_message)
+                failure_element.text = self._get_cleaned_traceback(report)
+            
+            elif report.skipped:
+                skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
+                ET.SubElement(testcase, 'skipped',
+                              **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
+            
+            item = next((i for i in self.session.items if i.nodeid == report.nodeid), None)
+            # Make sure item is not None before trying to get properties
+            if item:
+                all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
+                flat_properties = [prop for sublist in all_properties for prop in sublist]
+                if flat_properties:
+                    properties_element = ET.SubElement(testcase, 'properties')
+                    for prop_name, prop_value in flat_properties:
+                        ET.SubElement(properties_element, 'property', name=str(prop_name), value=str(prop_value))
+            
+            # Atomically write the report file, overwriting any previous result for this test.
+            ET.ElementTree(testcase).write(report_fname, encoding='utf-8', xml_declaration=True)
     
     def pytest_sessionstart(self, session):
         """
-        Initializes the reporting process.
-        - For single runs: Cleans up old locks and creates the main report file.
-        - For xdist master: Cleans up and creates a temporary directory for worker reports.
+        Initializes the reporting process. Only the master node will
+        clean up the temporary directory and initialize the JIRA connection.
         """
-        # This hook runs on master and all workers. We only want the master to initialize.
-        if not self.is_xdist_worker:
+        self.session = session
+        if self.is_xdist_master:
+            self._init_jira_helper()
+            
             if os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
-            os.makedirs(self.temp_dir)
-            
-            # For single-process mode, we also create the initial report file.
-            try:
-                os.remove(self.lock_path)
-            except FileNotFoundError:
-                pass
-            
-            root = ET.Element('testsuites')
-            main_suite = ET.SubElement(
-                root, 'testsuite',
-                name='pytest',
-                timestamp=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
-                hostname=socket.gethostname()
-            )
-            
-            properties_element = ET.SubElement(main_suite, 'properties')
-            ET.SubElement(properties_element, 'property', name='ip_address',
-                          value=socket.gethostbyname(socket.gethostname()))
-            ET.SubElement(properties_element, 'property', name='hostname', value=socket.gethostname())
-            
-            all_metadata_lists = self.config.hook.pytest_testhide_add_metadata(plugin=self)
-            for metadata_list in all_metadata_lists:
-                for name, value in metadata_list:
-                    ET.SubElement(properties_element, 'property', name=str(name), value=str(value))
-            
-            tree = ET.ElementTree(root)
-            ET.indent(tree, space="\t", level=0)
-            tree.write(self.report_xml_path, encoding='utf-8', xml_declaration=True)
+            os.makedirs(self.temp_dir, exist_ok=True)
     
-    def pytest_runtest_teardown(self, item):
-        """
-        Handles report generation after each test.
-        - For single runs: Locks and incrementally updates the main report file.
-        - For xdist workers: Creates a small, unique XML file in a temp directory.
-        """
-        if item.nodeid not in self.test_reports:
+    def _merge_temp_dir_into_final(self):
+        """Read everything from temp_dir and update the final junittests.xml (once!)."""
+        if self._merged:
             return
+        self._merged = True
         
-        report = self.test_reports[item.nodeid]
+        with FileLock(self.report_xml_path + ".lock"):
+            root = ET.Element('testsuites')
+            suite = ET.SubElement(root, 'testsuite',
+                                  name='pytest',
+                                  timestamp=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+                                  hostname=socket.gethostname())
+            
+            props = ET.SubElement(suite, 'properties')
+            ET.SubElement(props, 'property', name='ip_address',
+                          value=socket.gethostbyname(socket.gethostname()))
+            ET.SubElement(props, 'property', name='hostname',
+                          value=socket.gethostname())
+            
+            for meta in self.config.hook.pytest_testhide_add_metadata(plugin=self):
+                for k, v in meta:
+                    ET.SubElement(props, 'property', name=str(k), value=str(v))
+            
+            if os.path.exists(self.temp_dir):
+                for fname in sorted(os.listdir(self.temp_dir)):
+                    if fname.endswith('.xml'):
+                        try:
+                            case_tree = ET.parse(os.path.join(self.temp_dir, fname))
+                            suite.append(case_tree.getroot())
+                        except ET.ParseError:
+                            continue
+            
+            cases = suite.findall('testcase')
+            suite.set('tests', str(len(cases)))
+            suite.set('failures', str(len(suite.findall('.//failure'))))
+            suite.set('errors', str(len(suite.findall('.//error'))))
+            suite.set('skipped', str(len(suite.findall('.//skipped'))))
+            suite.set('time', f"{sum(float(c.get('time', 0)) for c in cases):.3f}")
+            
+            tmp = self.report_xml_path + '.tmp'
+            ET.indent(ET.ElementTree(root), space='\t', level=0)
+            ET.ElementTree(root).write(tmp, encoding='utf-8', xml_declaration=True)
+            os.replace(tmp, self.report_xml_path)
         
-        classname = f"{item.module.__name__}.{item.cls.__name__}" if item.cls else item.module.__name__
-        filepath, line, _ = item.location
-        testcase_attrs = {'classname': classname, 'name': item.name, 'file': str(filepath), 'line': str(line),
-                          'time': f"{report.duration:.3f}"}
-        testcase = ET.Element('testcase', **testcase_attrs)
-        
-        if report.failed:
-            tag = 'error' if report.when == 'setup' else 'failure'
-            cleaned_traceback = self._get_cleaned_traceback(report)
-            failure_element = ET.SubElement(testcase, tag, message=str(report.longrepr.reprcrash))
-            failure_element.text = cleaned_traceback
-        elif report.skipped:
-            skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
-            ET.SubElement(testcase, 'skipped',
-                          **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
-        
-        all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
-        flat_properties = [prop for sublist in all_properties for prop in sublist]
-        if flat_properties:
-            properties_element = ET.SubElement(testcase, 'properties')
-            for name, value in flat_properties:
-                ET.SubElement(properties_element, 'property', name=str(name), value=str(value))
-        
-        if self.is_xdist_worker:
-            # Parallel run: write to a unique file in the temp directory.
-            safe_nodeid = "".join(c for c in item.nodeid if c.isalnum() or c in ('_', '-')).rstrip()
-            temp_file_path = os.path.join(self.temp_dir, f"{safe_nodeid}.xml")
-            tree = ET.ElementTree(testcase)
-            tree.write(temp_file_path, encoding='utf-8', xml_declaration=True)
-        else:
-            # Single run: lock and update the main file.
-            with FileLock(self.lock_path):
-                try:
-                    tree = ET.parse(self.report_xml_path)
-                    main_suite = tree.find('testsuite')
-                    if main_suite is None: raise FileNotFoundError
-                except (FileNotFoundError, ET.ParseError):
-                    self.pytest_sessionstart(item.session)
-                    tree = ET.parse(self.report_xml_path)
-                    main_suite = tree.find('testsuite')
-                
-                main_suite.append(testcase)
-                
-                testcases = main_suite.findall('testcase')
-                main_suite.set('tests', str(len(testcases)))
-                main_suite.set('failures', str(len(main_suite.findall('.//failure'))))
-                main_suite.set('errors', str(len(main_suite.findall('.//error'))))
-                main_suite.set('skipped', str(len(main_suite.findall('.//skipped'))))
-                total_time = sum(float(tc.get('time', 0)) for tc in testcases)
-                main_suite.set('time', f"{total_time:.3f}")
-                
-                temp_file_path = self.report_xml_path + ".tmp"
-                ET.indent(tree, space="\t", level=0)
-                tree.write(temp_file_path, encoding='utf-8', xml_declaration=True)
-                os.replace(temp_file_path, self.report_xml_path)
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+    
+    def _signal_flush(self, signum, frame):
+        try:
+            self._merge_temp_dir_into_final()
+        finally:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
     
     def pytest_sessionfinish(self, session):
         """
-        Finalizes the report. This hook runs on all nodes.
-        Only the master node will perform the merge operation.
+        Finalizes the report. Only the master node will merge all temporary files.
+        The entire merge and write process is protected by a file lock.
         """
-        if self.is_xdist_worker:
-            return  # Workers do nothing at the end.
-        
-        # --- MERGE LOGIC (only runs on master node or in single-process mode) ---
-        if os.path.exists(self.temp_dir):
-            # If the temp dir exists, it means we were likely in an xdist run.
-            # We merge the individual reports into the main one.
-            with FileLock(self.lock_path):
-                tree = ET.parse(self.report_xml_path)
-                main_suite = tree.find('testsuite')
-                
-                for filename in os.listdir(self.temp_dir):
-                    if filename.endswith(".xml"):
-                        try:
-                            worker_tree = ET.parse(os.path.join(self.temp_dir, filename))
-                            main_suite.append(worker_tree.getroot())
-                        except ET.ParseError:
-                            continue
-                
-                # Recalculate final counts
-                testcases = main_suite.findall('testcase')
-                main_suite.set('tests', str(len(testcases)))
-                main_suite.set('failures', str(len(main_suite.findall('.//failure'))))
-                main_suite.set('errors', str(len(main_suite.findall('.//error'))))
-                main_suite.set('skipped', str(len(main_suite.findall('.//skipped'))))
-                total_time = sum(float(tc.get('time', 0)) for tc in testcases)
-                main_suite.set('time', f"{total_time:.3f}")
-                
-                temp_file_path = self.report_xml_path + ".tmp"
-                ET.indent(tree, space="\t", level=0)
-                tree.write(temp_file_path, encoding='utf-8', xml_declaration=True)
-                os.replace(temp_file_path, self.report_xml_path)
-            
-            # Clean up the temporary directory
-            shutil.rmtree(self.temp_dir)
+        if self.is_xdist_master:
+            self._merge_temp_dir_into_final()
+    
+    def pytest_unconfigure(self, config):
+        """
+        Called by PyTest once at the very end, after pytest_sessionfinish.
+        """
+        pass
 
 
 # --- Global functions that pytest discovers via entry points ---
 
 def pytest_addoption(parser):
-    """Adds the --report-xml command-line option."""
+    """Adds all command-line options for the plugin."""
     group = parser.getgroup('testhide-reporting', 'Testhide Incremental Reporting')
     group.addoption('--report-xml', action='store', default=None, help='Enable incremental XML reporting.')
+    
+    # JIRA options for automatic integration
+    group.addoption('--jira-url', dest='jira_url', default=None, action='store', help='JIRA URL for integration.')
+    group.addoption('--jira-username', dest='jira_username', default=None, action='store', help='JIRA username.')
+    group.addoption('--jira-password', dest='jira_password', default=None, action='store',
+                    help='JIRA password or API token.')
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
-    """Creates the plugin instance if enabled by the command line option."""
-    global plugin_instance
-    config.pluginmanager.add_hookspecs(hookspecs)
-    if config.option.report_xml:
-        plugin_instance = TesthidePlugin(config)
+    try:
+        config.pluginmanager.add_hookspecs(hookspecs)
+    except pluggy.PluginValidationError:
+        pass
+    
+    if not config.option.report_xml:
+        return
 
+    base_name = "testhide_plugin"
 
-def pytest_unconfigure(config):
-    """Cleans up the plugin instance at the end."""
-    global plugin_instance
-    plugin_instance = None
+    if config.pluginmanager.has_plugin(base_name + "_active"):
+        return
 
-
-def pytest_sessionstart(session):
-    if plugin_instance:
-        plugin_instance.pytest_sessionstart(session)
-
-
-def pytest_runtest_logreport(report):
-    if plugin_instance:
-        plugin_instance.pytest_runtest_logreport(report)
-
-
-def pytest_runtest_teardown(item):
-    if plugin_instance:
-        plugin_instance.pytest_runtest_teardown(item)
-
-
-def pytest_sessionfinish(session):
-    if plugin_instance:
-        plugin_instance.pytest_sessionfinish(session)
+    config.pluginmanager.register(TesthidePlugin(config), base_name + "_active")
