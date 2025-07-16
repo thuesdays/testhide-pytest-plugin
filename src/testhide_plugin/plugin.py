@@ -67,7 +67,7 @@ class TesthidePlugin:
         self.report_xml_path = config.option.report_xml
         self.temp_dir = os.path.join(str(config.rootdir), f".{os.path.basename(self.report_xml_path)}_temp")
         self.is_xdist_master = not hasattr(config, "workerinput")
-        self.is_xdist_run = config.option.dist != "no"
+        self.is_xdist_run = getattr(config.option, 'dist', 'no') != 'no'
         self.rerun_counters = {}
         self.test_reports = {}
         
@@ -152,7 +152,7 @@ class TesthidePlugin:
             if summary not in "".join(final_trace_lines):
                 final_trace_lines.append(summary)
             
-            return "\n".join(final_trace_lines)
+            return "".join(final_trace_lines)
         else:
             return summary
     
@@ -167,6 +167,21 @@ class TesthidePlugin:
         
         if report.when in ('setup', 'call') and getattr(report, 'outcome', '') != 'rerun':
             item._final_report = report
+        
+        if call.when == 'call' and call.excinfo:
+            fail_message = str(call.excinfo.value)
+            try:
+                fail_id = '%s.%s.%s.%s' % \
+                          (item.module.__name__,
+                           item.cls.__name__ if item.cls
+                           else item.module.__name__,
+                           re.sub(r'\[.+\]$', '', item.name),
+                           '%s(%s)' % (call.excinfo.typename, fail_message))
+            except AttributeError:
+                return
+            fail_id = fail_id.encode('utf-8')
+            fail_id = md5(fail_id).hexdigest()
+            item.fail_id = fail_id
     
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_teardown(self, item):
@@ -178,19 +193,17 @@ class TesthidePlugin:
         if not report:
             return
         
-        filepath, line, name = report.location
+        filepath, line, _ = report.location
+        name = item.originalname if hasattr(item, 'originalname') else item.name
+        name = name.split('[')[0]
         classname_path = report.nodeid.split('::')
         if len(classname_path) > 2:
             classname = ".".join(classname_path[:-1]).replace('/', '.')
         else:
             classname = os.path.splitext(os.path.basename(filepath))[0]
         
-        testcase_attrs = {
-            'classname': classname, 'name': name, 'file': str(filepath),
-            'line': str(line), 'time': f"{report.duration:.3f}"
-        }
-        testcase = ET.Element('testcase', **testcase_attrs)
-        
+        fail_id = getattr(item, 'fail_id', None)
+        test_resolution = 'Product Defect'
         if report.failed:
             tag = 'error' if report.when == 'setup' else 'failure'
             failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr, 'reprcrash') else str(
@@ -198,34 +211,55 @@ class TesthidePlugin:
             
             if self.jira_enabled:
                 try:
-                    sub = re.sub(r'\[.+\]$', '', name)
-                    fail_id_str = f"{classname}.{sub}.{failure_message}"
-                    fail_id = md5(fail_id_str.encode('utf-8')).hexdigest()
-                    
-                    issue = self._get_issue_by_test_id(fail_id)
-                    if issue:
-                        issue_text = issue.fields.summary;
-                        issue_type = issue.fields.issuetype.name;
-                        issue_id = issue.permalink()
-                        status_name = issue.fields.status.name;
-                        test_resolution = 'Known issue'
-                        if status_name in ('Verified', 'Closed'):
-                            test_resolution = 'Need to reopen'
-                        elif status_name in ('Resolved', 'In Testing'):
-                            test_resolution = 'Resolved in branch'
-                        failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
-                    else:
-                        failure_message += f"@@testid#{fail_id}"
+                    if fail_id:
+                        issue = self._get_issue_by_test_id(fail_id)
+                        if issue:
+                            issue_text = issue.fields.summary
+                            issue_type = issue.fields.issuetype.name
+                            issue_id = issue.permalink()
+                            status_name = issue.fields.status.name
+                            if status_name in ('Verified', 'Closed'):
+                                if hasattr(issue.fields, 'customfield_10020') and issue.fields.customfield_10020:
+                                    status = issue.fields.customfield_10020.value
+                                    if status_name == 'Verified' and status == 'Verified at Branch':
+                                        test_resolution = 'Verified at Branch'
+                                    else:
+                                        test_resolution = 'Need to reopen'
+                                else:
+                                    test_resolution = 'Need to reopen'
+                            elif status_name in ['Resolved', 'In Testing']:
+                                test_resolution = 'Resolved in branch'
+                            else:
+                                test_resolution = 'Known issue'
+                            failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
                 except Exception as e:
                     self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
             
+            testcase_attrs = {
+                'classname': classname, 'name': name, 'file': str(filepath),
+                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": fail_id, "test_resolution": test_resolution,
+            }
+            testcase = ET.Element('testcase', **testcase_attrs)
             failure_element = ET.SubElement(testcase, tag, message=failure_message)
             failure_element.text = self._get_cleaned_traceback(report)
         
         elif report.skipped:
+            testcase_attrs = {
+                'classname': classname, 'name': name, 'file': str(filepath),
+                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": '',
+                "test_resolution": "Skipped",
+            }
+            testcase = ET.Element('testcase', **testcase_attrs)
             skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
             ET.SubElement(testcase, 'skipped',
                           **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
+        else:
+            testcase_attrs = {
+                'classname': classname, 'name': name, 'file': str(filepath),
+                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": '',
+                "test_resolution": "Passed",
+            }
+            testcase = ET.Element('testcase', **testcase_attrs)
         
         all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
         flat_properties = [prop for sublist in all_properties for prop in sublist]
