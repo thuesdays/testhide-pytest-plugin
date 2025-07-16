@@ -2,3 +2,4 @@
 dist/
 src/testhide_pytest_plugin.egg-info/
 .idea/
+src/testhide_plugin/__pycache__/
