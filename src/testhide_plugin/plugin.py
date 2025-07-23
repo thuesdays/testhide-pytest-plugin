@@ -113,10 +113,10 @@ class TesthidePlugin:
         if not self.jira:
             return None
         try:
-            issues = self.jira.search_issues(f'description ~ "testid#{test_id}" ORDER BY updated')
+            issues = self.jira.search_issues(f'description ~ "{test_id}" ORDER BY updated')
             return issues[0] if issues else None
         except Exception as e:
-            self.config.warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for testid#{test_id}: {e}")
+            self.config.warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for {test_id}: {e}")
             return None
     
     def _get_cleaned_traceback(self, report):
@@ -195,7 +195,6 @@ class TesthidePlugin:
         
         filepath, line, _ = report.location
         name = item.originalname if hasattr(item, 'originalname') else item.name
-        name = name.split('[')[0]
         classname_path = report.nodeid.split('::')
         if len(classname_path) > 2:
             classname = ".".join(classname_path[:-1]).replace('/', '.')
@@ -203,7 +202,7 @@ class TesthidePlugin:
             classname = os.path.splitext(os.path.basename(filepath))[0]
         
         fail_id = getattr(item, 'fail_id', None)
-        test_resolution = 'Product Defect'
+        test_resolution = 'Unresolved'
         if report.failed:
             tag = 'error' if report.when == 'setup' else 'failure'
             failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr, 'reprcrash') else str(
