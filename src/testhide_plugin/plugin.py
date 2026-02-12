@@ -194,7 +194,7 @@ class TesthidePlugin:
             return
         
         filepath, line, _ = report.location
-        name = item.originalname if hasattr(item, 'originalname') else item.name
+        name = item.name
         classname_path = report.nodeid.split('::')
         if len(classname_path) > 2:
             classname = ".".join(classname_path[:-1]).replace('/', '.')
@@ -266,13 +266,64 @@ class TesthidePlugin:
             properties_element = ET.SubElement(testcase, 'properties')
             for prop_name, prop_value in flat_properties:
                 ET.SubElement(properties_element, 'property', name=str(prop_name), value=str(prop_value))
-        
-        safe_nodeid = re.sub(r'[^A-Za-z0-9_.\[\]-]', '_', item.nodeid)
+                
+        nodeid_hash = md5(item.nodeid.encode('utf-8')).hexdigest()
         worker = getattr(self.config, 'workerinput', {}).get('workerid', 'master')
-        fname = os.path.join(self.temp_dir, f"{safe_nodeid}_{worker}.xml")
+        fname = os.path.join(self.temp_dir, f"{nodeid_hash}_{worker}.xml")
         
+        if os.name == 'nt' and not fname.startswith('\\\\?\\'):
+            fname = f"\\\\?\\{os.path.abspath(fname)}"
+        
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
         ET.ElementTree(testcase).write(fname, encoding='utf-8', xml_declaration=True)
     
+    def pytest_collectreport(self, report):
+        """
+        Captures collection errors (import failures, conftest crashes, syntax errors)
+        and writes them as <testcase> with <error> to the XML.
+        Without this hook, ERROR tests from the collection phase are completely
+        missing from the report because pytest never creates test items for them,
+        so pytest_runtest_teardown is never called.
+        """
+        if not report.failed:
+            return
+
+        nodeid = report.nodeid
+        # Derive classname: replace path separators with dots, strip .py
+        file_part = nodeid.split("::")[0]
+        classname = file_part.replace("/", ".").replace("\\", ".").replace(".py", "")
+        name = nodeid.rsplit("::", 1)[-1] if "::" in nodeid else nodeid
+
+        message = (
+            str(report.longrepr.reprcrash.message)
+            if hasattr(report.longrepr, 'reprcrash')
+            else str(report.longrepr)
+        )
+        trace = str(report.longrepr)
+
+        testcase = ET.Element('testcase',
+            classname=classname,
+            name=name,
+            file=file_part,
+            line="0",
+            time="0.000",
+            fail_id="",
+            test_resolution="Collection Error",
+        )
+        error_el = ET.SubElement(testcase, 'error', message=message)
+        error_el.text = trace
+
+        # Write to temp dir using the same pattern as pytest_runtest_teardown
+        nodeid_hash = md5(nodeid.encode('utf-8')).hexdigest()
+        worker = getattr(self.config, 'workerinput', {}).get('workerid', 'master')
+        fname = os.path.join(self.temp_dir, f"{nodeid_hash}_{worker}.xml")
+
+        if os.name == 'nt' and not fname.startswith('\\\\?\\'):
+            fname = f"\\\\?\\{os.path.abspath(fname)}"
+
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+        ET.ElementTree(testcase).write(fname, encoding='utf-8', xml_declaration=True)
+
     def pytest_sessionstart(self, session):
         """
         Initializes the reporting process. Only the master node will
