@@ -160,13 +160,20 @@ class TesthidePlugin:
     def pytest_runtest_makereport(self, item, call):
         """
         This wrapper hook intercepts the report after it is created and attaches it to the 'item'
-        object itself. This is more reliable than storing the state in a plugin.
+        object itself. We store per-phase reports so that pytest_runtest_logreport
+        can pick the "worst" outcome after all phases (including teardown) complete.
         """
         outcome = yield
         report = outcome.get_result()
         
-        if report.when in ('setup', 'call') and getattr(report, 'outcome', '') != 'rerun':
-            item._final_report = report
+        if getattr(report, 'outcome', '') != 'rerun':
+            # Store reports per-phase on the item
+            if not hasattr(item, '_phase_reports'):
+                item._phase_reports = {}
+            item._phase_reports[report.when] = report
+            # Keep _final_report for backward compat (best non-teardown report)
+            if report.when in ('setup', 'call'):
+                item._final_report = report
         
         if call.when == 'call' and call.excinfo:
             fail_message = str(call.excinfo.value)
@@ -183,19 +190,58 @@ class TesthidePlugin:
             fail_id = md5(fail_id).hexdigest()
             item.fail_id = fail_id
     
-    @pytest.hookimpl(trylast=True)
-    def pytest_runtest_teardown(self, item):
+    def pytest_runtest_logreport(self, report):
         """
-        Runs last, after all other teardowns.
-        Takes the final report attached to 'item' and writes XML.
+        Called after each phase report (setup, call, teardown) is generated.
+        We write XML only after the teardown phase — at that point all three
+        phase reports are available, including teardown fixture errors that
+        pytest_runtest_teardown would have missed.
         """
-        report = getattr(item, '_final_report', None)
-        if not report:
+        if report.when != 'teardown':
             return
         
-        filepath, line, _ = report.location
+        # Retrieve the item via the stored reference in the session
+        item = report._item if hasattr(report, '_item') else None
+        if item is None:
+            # Fallback: look up item from session by nodeid
+            try:
+                item = self._find_item_by_nodeid(report.nodeid)
+            except Exception:
+                pass
+        if item is None:
+            return
+        
+        phase_reports = getattr(item, '_phase_reports', {})
+        setup_report = phase_reports.get('setup')
+        call_report = phase_reports.get('call')
+        teardown_report = phase_reports.get('teardown')
+        
+        # Determine the "effective" report to use for the XML entry.
+        # Priority: setup error > call failure > teardown error > call passed
+        if setup_report and setup_report.failed:
+            effective_report = setup_report
+        elif call_report and call_report.failed:
+            effective_report = call_report
+        elif teardown_report and teardown_report.failed:
+            effective_report = teardown_report
+        elif call_report:
+            effective_report = call_report
+        elif setup_report:
+            effective_report = setup_report
+        else:
+            effective_report = teardown_report
+        
+        if not effective_report:
+            return
+        
+        # Calculate total duration across all phases
+        total_duration = sum(
+            getattr(r, 'duration', 0) for r in phase_reports.values() if r
+        )
+        
+        filepath, line, _ = effective_report.location
         name = item.name
-        classname_path = report.nodeid.split('::')
+        classname_path = effective_report.nodeid.split('::')
         if len(classname_path) > 2:
             classname = ".".join(classname_path[:-1]).replace('/', '.')
         else:
@@ -203,12 +249,28 @@ class TesthidePlugin:
         
         fail_id = getattr(item, 'fail_id', None)
         test_resolution = 'Unresolved'
-        if report.failed:
-            tag = 'error' if report.when == 'setup' else 'failure'
-            failure_message = str(report.longrepr.reprcrash.message) if hasattr(report.longrepr, 'reprcrash') else str(
-                report.longrepr)
+        
+        # Check if teardown failed (even if call passed)
+        teardown_failed = teardown_report and teardown_report.failed
+        
+        if effective_report.failed or teardown_failed:
+            # Determine which report to use for the error/failure message
+            if teardown_failed and not (effective_report.failed and effective_report.when in ('setup', 'call')):
+                # Teardown error takes precedence if call didn't fail
+                error_report = teardown_report
+                tag = 'error'
+                test_resolution = 'Teardown Error'
+            elif effective_report.when == 'setup':
+                error_report = effective_report
+                tag = 'error'
+            else:
+                error_report = effective_report
+                tag = 'failure'
             
-            if self.jira_enabled:
+            failure_message = str(error_report.longrepr.reprcrash.message) if hasattr(error_report.longrepr, 'reprcrash') else str(
+                error_report.longrepr)
+            
+            if self.jira_enabled and tag == 'failure':
                 try:
                     if fail_id:
                         issue = self._get_issue_by_test_id(fail_id)
@@ -236,31 +298,31 @@ class TesthidePlugin:
             
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
-                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": fail_id, "test_resolution": test_resolution,
+                'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": fail_id or '', "test_resolution": test_resolution,
             }
             testcase = ET.Element('testcase', **testcase_attrs)
             failure_element = ET.SubElement(testcase, tag, message=failure_message)
-            failure_element.text = self._get_cleaned_traceback(report)
+            failure_element.text = self._get_cleaned_traceback(error_report)
         
-        elif report.skipped:
+        elif effective_report.skipped:
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
-                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": '',
+                'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": '',
                 "test_resolution": "Skipped",
             }
             testcase = ET.Element('testcase', **testcase_attrs)
-            skipped_attrs = {'type': 'pytest.skip', 'message': report.longrepr[2]}
+            skipped_attrs = {'type': 'pytest.skip', 'message': effective_report.longrepr[2]}
             ET.SubElement(testcase, 'skipped',
-                          **skipped_attrs).text = f"{report.longrepr[0]}:{report.longrepr[1]}: {report.longrepr[2]}"
+                          **skipped_attrs).text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {effective_report.longrepr[2]}"
         else:
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
-                'line': str(line), 'time': f"{report.duration:.3f}", "fail_id": '',
+                'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": '',
                 "test_resolution": "Passed",
             }
             testcase = ET.Element('testcase', **testcase_attrs)
         
-        all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=report)
+        all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=effective_report)
         flat_properties = [prop for sublist in all_properties for prop in sublist]
         if flat_properties:
             properties_element = ET.SubElement(testcase, 'properties')
@@ -276,6 +338,14 @@ class TesthidePlugin:
         
         os.makedirs(os.path.dirname(fname), exist_ok=True)
         ET.ElementTree(testcase).write(fname, encoding='utf-8', xml_declaration=True)
+    
+    def _find_item_by_nodeid(self, nodeid):
+        """Look up a test item from the session by its nodeid."""
+        if self.session:
+            for item in self.session.items:
+                if item.nodeid == nodeid:
+                    return item
+        return None
     
     def pytest_collectreport(self, report):
         """
