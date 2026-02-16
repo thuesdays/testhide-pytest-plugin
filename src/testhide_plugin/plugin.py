@@ -311,9 +311,16 @@ class TesthidePlugin:
                 "test_resolution": "Skipped",
             }
             testcase = ET.Element('testcase', **testcase_attrs)
-            skipped_attrs = {'type': 'pytest.skip', 'message': effective_report.longrepr[2]}
-            ET.SubElement(testcase, 'skipped',
-                          **skipped_attrs).text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {effective_report.longrepr[2]}"
+            # longrepr is a tuple (file, lineno, message) for normal skips,
+            # but can be a ReprExceptionInfo object for xfail+teardown-error.
+            if isinstance(effective_report.longrepr, tuple) and len(effective_report.longrepr) >= 3:
+                skip_message = str(effective_report.longrepr[2])
+                skip_text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {skip_message}"
+            else:
+                skip_message = str(effective_report.longrepr)
+                skip_text = skip_message
+            skipped_attrs = {'type': 'pytest.skip', 'message': skip_message}
+            ET.SubElement(testcase, 'skipped', **skipped_attrs).text = skip_text
         else:
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
