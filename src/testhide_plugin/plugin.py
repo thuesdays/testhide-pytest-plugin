@@ -253,7 +253,27 @@ class TesthidePlugin:
         # Check if teardown failed (even if call passed)
         teardown_failed = teardown_report and teardown_report.failed
         
-        if effective_report.failed or teardown_failed:
+        # Detect xpass (unexpected pass on a strict xfail marker) BEFORE the
+        # failed branch.  pytest marks these as 'failed' but they are actually
+        # passing tests whose xfail marker should be removed — treat as Passed.
+        is_xpass = (
+            effective_report.failed
+            and not teardown_failed
+            and (
+                getattr(effective_report, 'wasxfail', None)
+                or (isinstance(effective_report.longrepr, str) and effective_report.longrepr.startswith('[XPASS(strict)]'))
+            )
+        )
+        
+        if is_xpass:
+            testcase_attrs = {
+                'classname': classname, 'name': name, 'file': str(filepath),
+                'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": '',
+                "test_resolution": "Passed",
+            }
+            testcase = ET.Element('testcase', **testcase_attrs)
+        
+        elif effective_report.failed or teardown_failed:
             # Determine which report to use for the error/failure message
             if teardown_failed and not (effective_report.failed and effective_report.when in ('setup', 'call')):
                 # Teardown error takes precedence if call didn't fail
@@ -305,22 +325,46 @@ class TesthidePlugin:
             failure_element.text = self._get_cleaned_traceback(error_report)
         
         elif effective_report.skipped:
-            testcase_attrs = {
-                'classname': classname, 'name': name, 'file': str(filepath),
-                'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": '',
-                "test_resolution": "Skipped",
-            }
-            testcase = ET.Element('testcase', **testcase_attrs)
-            # longrepr is a tuple (file, lineno, message) for normal skips,
-            # but can be a ReprExceptionInfo object for xfail+teardown-error.
-            if isinstance(effective_report.longrepr, tuple) and len(effective_report.longrepr) >= 3:
-                skip_message = str(effective_report.longrepr[2])
-                skip_text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {skip_message}"
+            # Detect xfail (expected failure): pytest marks these as "skipped"
+            # but sets the wasxfail attribute with the xfail reason.
+            xfail_reason = getattr(effective_report, 'wasxfail', None)
+            if xfail_reason:
+                # xfail tests are reported as failures with "Known Issue" resolution,
+                # matching the backend/frontend convention for known bugs.
+                test_resolution = 'Known Issue'
+                # Extract error message from longrepr
+                if isinstance(effective_report.longrepr, tuple) and len(effective_report.longrepr) >= 3:
+                    failure_message = f"Known Issue: {xfail_reason}"
+                    failure_text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {effective_report.longrepr[2]}"
+                else:
+                    failure_message = f"Known Issue: {xfail_reason}"
+                    failure_text = str(effective_report.longrepr)
+                testcase_attrs = {
+                    'classname': classname, 'name': name, 'file': str(filepath),
+                    'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": fail_id or '',
+                    "test_resolution": test_resolution,
+                }
+                testcase = ET.Element('testcase', **testcase_attrs)
+                failure_element = ET.SubElement(testcase, 'failure', message=failure_message)
+                failure_element.text = failure_text
             else:
-                skip_message = str(effective_report.longrepr)
-                skip_text = skip_message
-            skipped_attrs = {'type': 'pytest.skip', 'message': skip_message}
-            ET.SubElement(testcase, 'skipped', **skipped_attrs).text = skip_text
+                test_resolution = 'Skipped'
+                testcase_attrs = {
+                    'classname': classname, 'name': name, 'file': str(filepath),
+                    'line': str(line), 'time': f"{total_duration:.3f}", "fail_id": '',
+                    "test_resolution": test_resolution,
+                }
+                testcase = ET.Element('testcase', **testcase_attrs)
+                # longrepr is a tuple (file, lineno, message) for normal skips,
+                # but can be a ReprExceptionInfo object for xfail+teardown-error.
+                if isinstance(effective_report.longrepr, tuple) and len(effective_report.longrepr) >= 3:
+                    skip_message = str(effective_report.longrepr[2])
+                    skip_text = f"{effective_report.longrepr[0]}:{effective_report.longrepr[1]}: {skip_message}"
+                else:
+                    skip_message = str(effective_report.longrepr)
+                    skip_text = skip_message
+                skipped_attrs = {'type': 'pytest.skip', 'message': skip_message}
+                ET.SubElement(testcase, 'skipped', **skipped_attrs).text = skip_text
         else:
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
