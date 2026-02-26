@@ -379,6 +379,15 @@ class TesthidePlugin:
             properties_element = ET.SubElement(testcase, 'properties')
             for prop_name, prop_value in flat_properties:
                 ET.SubElement(properties_element, 'property', name=str(prop_name), value=str(prop_value))
+        
+        # Embed captured test output (steps, HTTP logs) in <system-out>
+        try:
+            test_output = self.config.hook.pytest_testhide_get_test_output(item=item, report=effective_report)
+            if test_output:
+                system_out = ET.SubElement(testcase, 'system-out')
+                system_out.text = str(test_output)
+        except Exception:
+            pass  # Hook not implemented or failed — skip silently
                 
         nodeid_hash = md5(item.nodeid.encode('utf-8')).hexdigest()
         worker = getattr(self.config, 'workerinput', {}).get('workerid', 'master')
