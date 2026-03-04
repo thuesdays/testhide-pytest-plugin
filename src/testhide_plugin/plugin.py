@@ -119,6 +119,22 @@ class TesthidePlugin:
             self.config.warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for {test_id}: {e}")
             return None
     
+    def _log_failure_info(self, nodeid, fail_id, issue=None):
+        """
+        Logs the fail_id and optional JIRA issue info to console and log.
+        """
+        parts = [f'fail_id={fail_id}']
+        if issue:
+            try:
+                parts.append(f'jira={issue.key}')
+                parts.append(f'status={issue.fields.status.name}')
+                parts.append(f'summary={issue.fields.summary}')
+            except Exception:
+                pass
+        info = ' | '.join(parts)
+        message = f'[testhide_fail_info][{nodeid}]: {info}'
+        print(message)
+    
     def _get_cleaned_traceback(self, report):
         """
         Filters the traceback to show only relevant entries by removing
@@ -566,3 +582,41 @@ def pytest_configure(config):
         return
     
     config.pluginmanager.register(TesthidePlugin(config), base_name + "_active")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """
+    Module-level hook that always fires (even without --report-xml).
+    Computes fail_id on test failure and prints it to console/log.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    
+    if call.when == 'call' and call.excinfo:
+        fail_message = str(call.excinfo.value)
+        try:
+            fail_id = '%s.%s.%s.%s' % \
+                      (item.module.__name__,
+                       item.cls.__name__ if item.cls
+                       else item.module.__name__,
+                       re.sub(r'\[.+\]$', '', item.name),
+                       '%s(%s)' % (call.excinfo.typename, fail_message))
+        except AttributeError:
+            return
+        fail_id = md5(fail_id.encode('utf-8')).hexdigest()
+        item.fail_id = fail_id
+        
+        # Always log fail_id to console
+        jira_info = ''
+        active_plugin = item.config.pluginmanager.get_plugin('testhide_plugin_active')
+        if active_plugin and active_plugin.jira_enabled and active_plugin.jira:
+            try:
+                issue = active_plugin._get_issue_by_test_id(fail_id)
+                if issue:
+                    jira_info = (f' | jira={issue.key}'
+                                 f' | status={issue.fields.status.name}'
+                                 f' | summary={issue.fields.summary}')
+            except Exception:
+                pass
+        print(f'[testhide_fail_info][{item.nodeid}]: fail_id={fail_id}{jira_info}')
