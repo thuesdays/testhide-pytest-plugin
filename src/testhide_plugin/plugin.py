@@ -564,6 +564,13 @@ def pytest_addoption(parser):
     group.addoption('--jira-username', dest='jira_username', default=None, action='store', help='JIRA username.')
     group.addoption('--jira-password', dest='jira_password', default=None, action='store',
                     help='JIRA password or API token.')
+    
+    # Quarantine support
+    group.addoption(
+        '--quarantine-file', dest='quarantine_file', default=None, action='store',
+        help='Path to file with quarantined test nodeids (one per line). '
+             'Can also be set via TESTHIDE_QUARANTINE_FILE env var.'
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -620,3 +627,65 @@ def pytest_runtest_makereport(item, call):
             except Exception:
                 pass
         print(f'[testhide_fail_info][{item.nodeid}]: fail_id={fail_id}{jira_info}')
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Quarantine hook: deselects quarantined tests before execution.
+    
+    Reads quarantined nodeids from a file specified by:
+      1. --quarantine-file CLI option
+      2. TESTHIDE_QUARANTINE_FILE environment variable
+    
+    The file is written by the C# agent before running pytest,
+    containing one quarantined nodeid per line (e.g. "tests/test_login.py::test_flaky_login").
+    
+    Supports both exact match and prefix match:
+      - "tests/test_login.py::TestLogin" matches all tests in that class
+      - "tests/test_login.py::TestLogin::test_flaky" matches exactly
+    """
+    quarantine_file = getattr(config.option, 'quarantine_file', None) or os.environ.get('TESTHIDE_QUARANTINE_FILE')
+    
+    if not quarantine_file or not os.path.isfile(quarantine_file):
+        return
+    
+    try:
+        with open(quarantine_file, 'r', encoding='utf-8') as f:
+            quarantined_nodeids = {
+                line.strip() for line in f if line.strip() and not line.startswith('#')
+            }
+    except Exception as e:
+        print(f'[testhide_quarantine] Failed to read quarantine file {quarantine_file}: {e}')
+        return
+    
+    if not quarantined_nodeids:
+        return
+    
+    remaining = []
+    deselected = []
+    
+    for item in items:
+        is_quarantined = False
+        
+        # Check exact match first
+        if item.nodeid in quarantined_nodeids:
+            is_quarantined = True
+        else:
+            # Check prefix match (class-level quarantine → all tests in class)
+            for qid in quarantined_nodeids:
+                if item.nodeid.startswith(qid + '::') or item.nodeid.startswith(qid + '['):
+                    is_quarantined = True
+                    break
+        
+        if is_quarantined:
+            deselected.append(item)
+        else:
+            remaining.append(item)
+    
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = remaining
+        print(
+            f'[testhide_quarantine] Deselected {len(deselected)} quarantined tests '
+            f'(from {quarantine_file}), {len(remaining)} remaining'
+        )
