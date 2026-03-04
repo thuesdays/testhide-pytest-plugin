@@ -629,24 +629,66 @@ def pytest_runtest_makereport(item, call):
         print(f'[testhide_fail_info][{item.nodeid}]: fail_id={fail_id}{jira_info}')
 
 
+QUARANTINE_DEFAULT_FILENAME = '.testhide_quarantine_file'
+
+
+def _resolve_quarantine_path(config):
+    """
+    Resolve the quarantine file path.
+    
+    Priority:
+      1. --quarantine-file CLI option
+      2. TESTHIDE_QUARANTINE_FILE environment variable
+      3. .testhide_quarantine_file in the working directory (auto-discovery)
+    
+    Supports both absolute and relative paths (relative = resolved against cwd).
+    Returns None if no quarantine file exists.
+    """
+    explicit = getattr(config.option, 'quarantine_file', None) or os.environ.get('TESTHIDE_QUARANTINE_FILE')
+    
+    if explicit:
+        # Support both absolute and relative paths
+        resolved = os.path.abspath(explicit)
+        if os.path.isfile(resolved):
+            return resolved
+        # Not found — don't fall back, user explicitly set a path
+        print(f'[testhide_quarantine] Quarantine file not found: {resolved}')
+        return None
+    
+    # Auto-discovery: check default file in working directory
+    default_path = os.path.join(os.getcwd(), QUARANTINE_DEFAULT_FILENAME)
+    if os.path.isfile(default_path):
+        return default_path
+    
+    # Also check rootdir (pytest may change cwd)
+    rootdir = str(getattr(config, 'rootdir', ''))
+    if rootdir:
+        rootdir_path = os.path.join(rootdir, QUARANTINE_DEFAULT_FILENAME)
+        if os.path.isfile(rootdir_path):
+            return rootdir_path
+    
+    return None
+
+
 def pytest_collection_modifyitems(config, items):
     """
     Quarantine hook: deselects quarantined tests before execution.
     
-    Reads quarantined nodeids from a file specified by:
-      1. --quarantine-file CLI option
-      2. TESTHIDE_QUARANTINE_FILE environment variable
+    Reads quarantined nodeids from a file. File resolution:
+      1. --quarantine-file CLI option (absolute or relative path)
+      2. TESTHIDE_QUARANTINE_FILE environment variable (absolute or relative)
+      3. .testhide_quarantine_file in working directory (auto-discovery)
     
     The file is written by the C# agent before running pytest,
-    containing one quarantined nodeid per line (e.g. "tests/test_login.py::test_flaky_login").
+    containing one quarantined nodeid per line.
     
     Supports both exact match and prefix match:
       - "tests/test_login.py::TestLogin" matches all tests in that class
       - "tests/test_login.py::TestLogin::test_flaky" matches exactly
     """
-    quarantine_file = getattr(config.option, 'quarantine_file', None) or os.environ.get('TESTHIDE_QUARANTINE_FILE')
+    quarantine_file = _resolve_quarantine_path(config)
     
-    if not quarantine_file or not os.path.isfile(quarantine_file):
+    if not quarantine_file:
         return
     
     try:
