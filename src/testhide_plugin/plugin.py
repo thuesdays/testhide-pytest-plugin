@@ -259,7 +259,15 @@ class TesthidePlugin:
         name = item.name
         classname_path = effective_report.nodeid.split('::')
         if len(classname_path) > 2:
-            classname = ".".join(classname_path[:-1]).replace('/', '.')
+            # Strip file extension from the path segment before converting to
+            # dotted classname. Without this, nodeid "tests/path/test_file.py::TestClass::test_foo"
+            # produces classname "tests.path.test_file.py.TestClass" — the extension segment
+            # confuses reconstruction. Works for any language (.py, .ts, .cs, .java, etc.).
+            raw_classname = ".".join(classname_path[:-1]).replace('/', '.')
+            # Remove known file extensions that appear as dot-separated segments
+            _ext_set = {'py', 'ts', 'js', 'jsx', 'tsx', 'cs', 'java', 'kt', 'rb', 'go', 'rs', 'cpp', 'cc', 'c', 'swift', 'scala', 'php'}
+            _parts = raw_classname.split('.')
+            classname = '.'.join(p for p in _parts if p.lower() not in _ext_set)
         else:
             classname = os.path.splitext(os.path.basename(filepath))[0]
         
