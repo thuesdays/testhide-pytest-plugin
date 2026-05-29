@@ -15,6 +15,7 @@ from datetime import datetime
 import pluggy
 import pytest
 from . import hookspecs
+from .report_core import SCHEMA_VERSION, compute_fail_id
 
 # This global instance holds our active plugin, but only if it's enabled.
 plugin_instance = None
@@ -194,16 +195,15 @@ class TesthidePlugin:
         if call.when == 'call' and call.excinfo:
             fail_message = str(call.excinfo.value)
             try:
-                fail_id = '%s.%s.%s.%s' % \
-                          (item.module.__name__,
-                           item.cls.__name__ if item.cls
-                           else item.module.__name__,
-                           re.sub(r'\[.+\]$', '', item.name),
-                           '%s(%s)' % (call.excinfo.typename, fail_message))
+                fail_id = compute_fail_id(
+                    item.module.__name__,
+                    item.cls.__name__ if item.cls else item.module.__name__,
+                    item.name,
+                    call.excinfo.typename,
+                    fail_message,
+                )
             except AttributeError:
                 return
-            fail_id = fail_id.encode('utf-8')
-            fail_id = md5(fail_id).hexdigest()
             item.fail_id = fail_id
     
     def pytest_runtest_logreport(self, report):
@@ -335,7 +335,7 @@ class TesthidePlugin:
                             elif status_name in ['Resolved', 'In Testing']:
                                 test_resolution = 'Resolved in branch'
                             else:
-                                test_resolution = 'Known issue'
+                                test_resolution = 'Known Issue'
                             failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
                 except Exception as e:
                     self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
@@ -505,6 +505,7 @@ class TesthidePlugin:
                                   hostname=socket.gethostname())
             
             props = ET.SubElement(suite, 'properties')
+            ET.SubElement(props, 'property', name='testhide_schema_version', value=SCHEMA_VERSION)
             ET.SubElement(props, 'property', name='ip_address',
                           value=socket.gethostbyname(socket.gethostname()))
             ET.SubElement(props, 'property', name='hostname',
@@ -611,15 +612,15 @@ def pytest_runtest_makereport(item, call):
     if call.when == 'call' and call.excinfo:
         fail_message = str(call.excinfo.value)
         try:
-            fail_id = '%s.%s.%s.%s' % \
-                      (item.module.__name__,
-                       item.cls.__name__ if item.cls
-                       else item.module.__name__,
-                       re.sub(r'\[.+\]$', '', item.name),
-                       '%s(%s)' % (call.excinfo.typename, fail_message))
+            fail_id = compute_fail_id(
+                item.module.__name__,
+                item.cls.__name__ if item.cls else item.module.__name__,
+                item.name,
+                call.excinfo.typename,
+                fail_message,
+            )
         except AttributeError:
             return
-        fail_id = md5(fail_id.encode('utf-8')).hexdigest()
         item.fail_id = fail_id
         
         # Always log fail_id to console

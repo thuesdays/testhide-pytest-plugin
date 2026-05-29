@@ -1,4 +1,5 @@
 .pypirc
+.env.local
 dist/
 src/testhide_pytest_plugin.egg-info/
 .idea/
