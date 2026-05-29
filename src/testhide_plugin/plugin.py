@@ -10,7 +10,7 @@ import shutil
 import re
 from hashlib import md5
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pluggy
 import pytest
@@ -500,17 +500,28 @@ class TesthidePlugin:
         with FileLock(self.report_xml_path + ".lock"):
             root = ET.Element('testsuites')
             suite = ET.SubElement(root, 'testsuite',
-                                  name='pytest',
-                                  timestamp=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+                                  name=(self.config.getoption('suite_name') or 'pytest'),
+                                  # ISO-8601 UTC WITH the trailing 'Z' (Report Format v1 §4).
+                                  timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
                                   hostname=socket.gethostname())
-            
+
             props = ET.SubElement(suite, 'properties')
+            # REQUIRED in v1 (parity with unittest / .NET / JS plugins).
             ET.SubElement(props, 'property', name='testhide_schema_version', value=SCHEMA_VERSION)
             ET.SubElement(props, 'property', name='ip_address',
                           value=socket.gethostbyname(socket.gethostname()))
             ET.SubElement(props, 'property', name='hostname',
                           value=socket.gethostname())
-            
+
+            # --meta KEY=VALUE (repeatable) → suite properties.
+            for _item in (self.config.getoption('meta') or []):
+                if '=' in _item:
+                    _k, _v = _item.split('=', 1)
+                    _k = _k.strip()
+                    if _k:
+                        ET.SubElement(props, 'property', name=_k, value=_v)
+
+            # Programmatic metadata via the hook (back-compat / conftest plugins).
             for meta in self.config.hook.pytest_testhide_add_metadata(plugin=self):
                 for k, v in meta:
                     ET.SubElement(props, 'property', name=str(k), value=str(v))
@@ -567,7 +578,14 @@ def pytest_addoption(parser):
     """Adds all command-line options for the plugin."""
     group = parser.getgroup('testhide-reporting', 'Testhide Incremental Reporting')
     group.addoption('--report-xml', action='store', default=None, help='Enable incremental XML reporting.')
-    
+
+    # Suite identity + metadata (parity with the unittest / .NET / JS plugins).
+    group.addoption('--suite-name', dest='suite_name', default='pytest', action='store',
+                    help='Value for <testsuite name="..."> in the report. Default: pytest.')
+    group.addoption('--meta', dest='meta', default=[], action='append', metavar='KEY=VALUE',
+                    help='Add a suite-level <property name=KEY value=VALUE>. Repeatable, '
+                         'e.g. --meta build=1042 --meta branch=main.')
+
     # JIRA options for automatic integration
     group.addoption('--jira-url', dest='jira_url', default=None, action='store', help='JIRA URL for integration.')
     group.addoption('--jira-username', dest='jira_username', default=None, action='store', help='JIRA username.')

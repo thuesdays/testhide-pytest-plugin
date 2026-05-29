@@ -24,6 +24,15 @@ To activate the plugin and generate a report, use the --report-xml option:
 pytest --report-xml=junittests.xml
 ```
 
+### Suite name & metadata
+Set the `<testsuite name="...">` and attach suite-level metadata (repeatable). Reserved
+names `build` / `branch` get special handling in Testhide; everything else is free metadata.
+```bash
+pytest --report-xml=junittests.xml \
+       --suite-name=api-tests \
+       --meta build=1042 --meta branch=main
+```
+
 ## Parallel Execution (pytest-xdist)
 The plugin is fully compatible with `pytest-xdist` out of the box. Simply add the -n flag to run tests in multiple processes. The plugin will automatically handle and merge the results from all worker nodes.
 ```bash
