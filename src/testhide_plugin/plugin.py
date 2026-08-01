@@ -825,8 +825,17 @@ def pytest_cmdline_main(config):
 
     Returning None (not a value) lets the rest of the chain run normally; by the time xdist's own
     impl is called the flag reads False, so it delegates to the ordinary main.
+
+    The predicate asks BOTH questions on purpose. A persistent session implies --testhide-batch, but
+    that implication is written in pytest_configure — and measured against pytest 9.1.1,
+    `_pytest.main.pytest_cmdline_main` IS `wrap_session(config, _main)`, which is what calls
+    `_do_configure()`. So configure runs INSIDE this hook, strictly after this tryfirst guard has
+    already read the flag and returned. Reading only the flag left every session-mode run undefended:
+    measured, `TESTHIDE_SESSION_DIR=<ctl> pytest -f` never returned and had to be killed at 25s,
+    with or without the option form of the directory. _session_control_dir reads only the option
+    namespace and the environment, both of which exist this early.
     """
-    if not getattr(config.option, 'testhide_batch', False):
+    if not (getattr(config.option, 'testhide_batch', False) or _session_control_dir(config)):
         return None
     if getattr(config.option, 'looponfail', False):
         config.option.looponfail = False
@@ -856,12 +865,35 @@ _WAVE_POLL_SEC = 0.02
 # this long doing nothing if the client dies without writing `stop`, so it is deliberately shorter
 # than the build-level timeouts that would otherwise be the only thing to notice.
 _WAVE_IDLE_TIMEOUT_SEC = 600.0
-# Consecutive waves where every single test errored before the session gives up. Two, not
-# one: a batch can legitimately land entirely inside one broken class.
-_MAX_ALL_ERROR_WAVES = 2
+# How many tests may error in an unbroken run before the session gives up. Counted in TESTS rather
+# than waves: a wave is `max_tests_per_one_execute` tests, a job setting the plugin never sees, and
+# every writer of it defaults to 1 — so a wave-counted threshold of 2 meant "two adjacent erroring
+# tests", which is what ONE ordinary broken class fixture looks like. The reasoning this guard was
+# written for (a session fixture cached as failed answers in 38ms and out-competes healthy nodes)
+# needs a number in the same units as the evidence.
+_MAX_ALL_ERROR_TESTS = 20
+# ...and never on a single wave, however large: one batch can legitimately land entirely inside one
+# broken class.
+_MIN_ALL_ERROR_WAVES = 2
+# Consecutive waves whose nodeids name FILES this session does not know at all, before concluding
+# the session cannot serve the queue it is being given. See the rule at the call site for why a
+# missing file is the discriminator and a missing test is not.
+_MAX_UNKNOWN_FILE_WAVES = 2
 
 
-class _WaveBoundary:
+class _Chain:
+    """Anything with a listchain(), which is all SetupState.teardown_exact reads of `nextitem`."""
+
+    __slots__ = ('_chain',)
+
+    def __init__(self, chain=()):
+        self._chain = list(chain)
+
+    def listchain(self):
+        return self._chain
+
+
+class _WaveBoundary(_Chain):
     """The sentinel handed to pytest as `nextitem` for the LAST item of a wave.
 
     SetupState.teardown_exact does:
@@ -876,25 +908,45 @@ class _WaveBoundary:
                               works.
       * [session]             keeps the session, pops module and class. Measured module 5x, class
                               8x, -4.3% against today. Also looks like it works.
-      * the finished item's   pops NOTHING. The stack stands exactly as the last test left it and is
-        own chain             trimmed at the START of the next wave, when the destination is known
-                              and the pops are the ones a vanilla run would have made anyway.
+      * the finished item's   pops the item and NOTHING above it. The class, module and session
+        chain MINUS itself    stand exactly as the last test left them and are trimmed at the START
+                              of the next wave, when the destination is known and the pops are the
+                              ones a vanilla run would have made anyway.
 
     Only the third gives fixture parity with vanilla, so the chain is rebound at every boundary
     rather than built once from the session.
+
+    `[:-1]` is not cosmetic. Holding the FULL chain pops nothing at all, which defers the item's own
+    function-scoped teardown past the point where its verdict is published — so a fixture that fails
+    on the way out was reported as a pass. Vanilla pops exactly this one level between two tests of
+    the same class (measured against SetupState: stack [session, module, class, A] against
+    needed [session, module, class] pops A and stops), so trimming restores parity AND leaves only
+    class/module/session teardown deferred. That remainder cannot be resolved here — whether the
+    class continues is not known until the next wave arrives — and is carried by `amended`.
     """
 
-    __slots__ = ('_chain',)
-
-    def __init__(self):
-        self._chain = []
+    __slots__ = ()
 
     def hold(self, item):
-        self._chain = list(item.listchain())
+        self._chain = list(item.listchain())[:-1]
         return self
 
-    def listchain(self):
-        return self._chain
+
+class _BrokenCollectors:
+    """The files whose collection FAILED, so the wave loop can tell why a nodeid is missing.
+
+    Registered before collection, because that is when the answer is produced and there is nowhere
+    later to recover it from: session.items holds what WAS collected, and a file that did not import
+    leaves no trace in it. `session.testsfailed` is not a substitute — it also counts ordinary test
+    failures, so it cannot distinguish the two cases the wave loop has to tell apart.
+    """
+
+    def __init__(self):
+        self.files = set()
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.files.add(str(report.nodeid).split('::')[0])
 
 
 class _WaveRunner:
@@ -903,18 +955,31 @@ class _WaveRunner:
     The control channel is a DIRECTORY, named by the TESTHIDE_SESSION_DIR environment variable:
 
         wave-<n>.json        written by the client:  {"nodeids": [...]}
-        wave-<n>.done.json   written by us:          {"results": [...], "not_collected": [...]}
+        wave-<n>.done.json   written by us:          {"results": [], "not_collected": [], "amended": []}
+        session-ended.json   written by us:          {"amended": []}
         stop                 written by the client:  end the session
 
     A directory rather than an argument, because the executor may be started by the CUSTOMER'S OWN
     run_command template, where the client has nowhere to insert a flag; environment variables are
     already threaded into that path. Files rather than a pipe, because a wave has to survive the
     client reading stdout on a different schedule than the tests write to it.
+
+    `amended` exists because one verdict per wave cannot be final when the wave ends. The last item
+    of a wave keeps its class, module and session alive across the boundary — that IS the feature —
+    so a teardown at any of those scopes runs later, once the next wave says whether the class
+    continues. Its outcome is therefore published one wave late, against a nodeid the previous wave
+    already answered for. A revision, not a result: the client marks these rows so the backend
+    supersedes the stored one instead of dropping them as duplicates, which is what it does to any
+    nodeid it has already seen.
+
+    Every wave gets exactly one done file and the session gets exactly one end marker, so a client
+    that reads both learns every verdict the session produced.
     """
 
     def __init__(self, control_dir):
         self.control_dir = control_dir
         self._wave_reports = {}
+        self._published = {}
 
     # -- report capture -------------------------------------------------------------------
     def pytest_runtest_logreport(self, report):
@@ -960,9 +1025,24 @@ class _WaveRunner:
                 except (ValueError, OSError):
                     # Written but not yet flushed. Re-read rather than treating a partial file as
                     # an empty wave, which would report every nodeid in it as not collected.
-                    time.sleep(_WAVE_POLL_SEC)
-                    continue
-                return [str(x) for x in (payload.get('nodeids') or [])]
+                    #
+                    # Falling through to the SAME exits a missing file gets, rather than looping
+                    # straight back to the top. A file that exists and never parses — a leftover in
+                    # a reused control directory, a wave-N.json that is a directory, a truncated
+                    # write by anything other than our own client — used to re-enter this branch
+                    # every iteration, so `stop` and the idle deadline below were both unreachable
+                    # and the executor spun at 50Hz holding its node until the build timed out.
+                    # Measured: killed at 25s with the deadline set to 2s.
+                    pass
+                else:
+                    nodeids = (payload if isinstance(payload, dict) else {}).get('nodeids') or []
+                    # Deduplicated, and ORDER-PRESERVING. A repeated nodeid in one wave would
+                    # otherwise be run twice and reported once — the second verdict overwriting the
+                    # first, since results are keyed by nodeid — so a passing run could be published
+                    # as the failure of its own duplicate. The queue can genuinely contain one:
+                    # reclaim_dead_executors $pushes a dead child's running list back without
+                    # $addToSet, so two concurrent reclaims of the same child duplicate every id.
+                    return list(dict.fromkeys(str(x) for x in nodeids))
             if os.path.exists(stop):
                 return None
             if time.time() > deadline:
@@ -971,14 +1051,30 @@ class _WaveRunner:
                 return None
             time.sleep(_WAVE_POLL_SEC)
 
-    def _write_done(self, n, results, not_collected):
-        tmp = os.path.join(self.control_dir, 'wave-%d.done.tmp' % n)
-        final = os.path.join(self.control_dir, 'wave-%d.done.json' % n)
+    def _write_json(self, name, payload):
+        tmp = os.path.join(self.control_dir, name + '.tmp')
+        final = os.path.join(self.control_dir, name)
         with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump({'results': results, 'not_collected': not_collected}, fh)
+            json.dump(payload, fh)
         # Atomic: the client polls for this file's existence, so it must never observe a half-written
         # one and conclude the wave produced two results out of twenty.
         os.replace(tmp, final)
+
+    def _write_done(self, n, results, not_collected, amended):
+        self._write_json('wave-%d.done.json' % n,
+                         {'results': results, 'not_collected': not_collected, 'amended': amended})
+
+    def _amend(self, nodeid):
+        """The verdict for `nodeid` as it stands NOW, if that differs from what was published.
+
+        Returns None when nothing changed, which is the common case: a wave's last item usually has
+        no teardown left to run at class or module scope, and a test that already failed in its call
+        phase stays failed whatever its teardown does.
+        """
+        outcome, duration = self._verdict(nodeid)
+        if outcome == self._published.get(nodeid):
+            return None
+        return {'nodeid': nodeid, 'outcome': outcome, 'duration': round(duration, 6)}
 
     def _boundary_teardown(self, session, next_first, owner):
         """Run the held teardown, and make a failure in it visible instead of fatal.
@@ -1006,9 +1102,14 @@ class _WaveRunner:
 
     def run(self, session):
         by_id = {item.nodeid: item for item in session.items}
+        known_files = {nodeid.split('::')[0] for nodeid in by_id}
+        broken = session.config.pluginmanager.get_plugin('testhide_broken_collectors')
+        broken_files = broken.files if broken is not None else set()
         boundary = _WaveBoundary()
         held_item = None
-        all_error_waves = 0       # consecutive waves in which EVERY test errored
+        error_streak_tests = 0    # tests errored in an unbroken run of all-error waves
+        all_error_waves = 0       # ...and how many waves that took
+        unknown_file_waves = 0    # consecutive waves naming files this session never collected
         n = 0
 
         session.config.pluginmanager.register(self, 'testhide_wave_runner')
@@ -1026,10 +1127,15 @@ class _WaveRunner:
                     else:
                         items.append(item)
 
+                amended = []
                 if items and held_item is not None:
                     self._boundary_teardown(session, items[0], held_item)
+                    row = self._amend(held_item.nodeid)
+                    if row is not None:
+                        amended.append(row)
 
                 self._wave_reports = {}
+                self._published = {}
                 for i, item in enumerate(items):
                     nextitem = items[i + 1] if i + 1 < len(items) else boundary.hold(item)
                     item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
@@ -1040,9 +1146,10 @@ class _WaveRunner:
                 results = []
                 for item in items:
                     outcome, duration = self._verdict(item.nodeid)
+                    self._published[item.nodeid] = outcome
                     results.append({'nodeid': item.nodeid, 'outcome': outcome,
                                     'duration': round(duration, 6)})
-                self._write_done(n, results, not_collected)
+                self._write_done(n, results, not_collected, amended)
 
                 if not_collected:
                     # Loud, because the alternative is a nodeid that was assigned and simply never
@@ -1051,35 +1158,69 @@ class _WaveRunner:
                           % (n, len(not_collected), ', '.join(not_collected[:5])))
 
                 if not_collected and not items:
-                    # NOTHING in this wave was visible. That is not a broken test file — a broken
-                    # file leaves its siblings collectable — it is a session whose scope does not
-                    # cover what it is being assigned: an executor started on one file, or on a
-                    # different rootdir, than the queue was built from. Every later wave would
-                    # produce the same empty answer, so serving them means holding a node while
-                    # reporting nothing, forever.
-                    #
-                    # A PARTIAL miss is deliberately NOT fatal. That is the broken-module case, and
-                    # ending there would stop an executor that is still running every other test
-                    # correctly — the healthy nodeids in this very wave just reported.
-                    print('[testhide] wave %d had no collectable tests at all; this session cannot '
-                          'serve the queue it is being given, ending it' % n)
-                    print('[testhide]   rootdir: %s' % session.config.rootdir)
-                    if by_id:
-                        print('[testhide]   this session collected ids like: %s'
-                              % next(iter(by_id)))
-                        print('[testhide]   the wave asked for:              %s' % wave[0])
-                        print('[testhide]   nodeids are relative to rootdir, so a rootdir that '
-                              'differs from the one discovery ran under renames every test. '
-                              'Passing --testhide-session-dir as TWO tokens with a path outside '
-                              'the tests directory does exactly that: pytest resolves rootdir '
-                              'before it knows the option, counts the value as a path argument, '
-                              'and moves rootdir up to the common ancestor. Deliver the directory '
-                              'as TESTHIDE_SESSION_DIR (immune), or write --testhide-session-dir='
-                              'PATH as one token (also immune). Measured on pytest 9.1.1.')
+                    # NOTHING in this wave was visible. The question this rule has to answer is
+                    # WHICH kind of nothing, because only one of them is worth ending a session
+                    # that is otherwise serving its queue correctly. Asked as "was the whole wave
+                    # missing?" it answered wrong for two of the three, and the wave is one test
+                    # by default — every writer of max_tests_per_one_execute defaults it to 1 — so
+                    # "the whole wave" and "one nodeid" were the same sentence.
+                    missing_files = {nid.split('::')[0] for nid in not_collected}
+                    if missing_files <= broken_files:
+                        # The FILE is here and failed to import. Its tests cannot be collected by
+                        # anyone, so handing the queue to another executor just repeats the import
+                        # on another node. pytest already printed the traceback; the wave reports
+                        # them as not collected, by name, which is the difference between a
+                        # diagnosable build and a silent one.
+                        print('[testhide] wave %d: every nodeid is in a file whose COLLECTION '
+                              'FAILED (%s). That is a broken module, not a session that cannot '
+                              'serve its queue, so the session continues.'
+                              % (n, ', '.join(sorted(missing_files)[:3])))
+                        unknown_file_waves = 0
+                    elif missing_files <= known_files:
+                        # The file is collected, the test is not: renamed, deleted, deselected, or
+                        # skipped at collection. Ordinary, and precisely the case the partial-miss
+                        # branch was written to survive — it only ever ran for waves of two or
+                        # more, so at the default batch of one a single renamed test ended the
+                        # session and every batch this executor still held went unanswered.
+                        # ASCII only in anything printed. A build agent decodes this stream on
+                        # Windows under a non-UTF-8 code page, and one em dash turns the whole
+                        # captured output into a UnicodeDecodeError.
+                        print('[testhide] wave %d: the file is collected but the test is not: '
+                              'renamed or removed since discovery ran. The session continues.' % n)
+                        unknown_file_waves = 0
                     else:
-                        print('[testhide]   this session collected NOTHING; check the paths the '
-                              'executor was started with')
-                    break
+                        # The FILE itself is unknown to this session. That is the scope case: an
+                        # executor started on one file, or under a different rootdir, than the
+                        # queue was built from. Every later wave produces the same empty answer, so
+                        # serving them means holding a node while reporting nothing, forever.
+                        unknown_file_waves += 1
+                        print('[testhide] wave %d asked for a file this session does not know: %s'
+                              % (n, ', '.join(sorted(missing_files - known_files)[:3])))
+                        if unknown_file_waves >= _MAX_UNKNOWN_FILE_WAVES:
+                            print('[testhide] %d waves in a row named files this session never '
+                                  'collected; it cannot serve the queue it is being given, ending '
+                                  'it' % unknown_file_waves)
+                            print('[testhide]   rootdir: %s' % session.config.rootdir)
+                            if by_id:
+                                print('[testhide]   this session collected ids like: %s'
+                                      % next(iter(by_id)))
+                                print('[testhide]   the wave asked for:              %s' % wave[0])
+                                print('[testhide]   nodeids are relative to rootdir, so a rootdir '
+                                      'that differs from the one discovery ran under renames every '
+                                      'test. Passing --testhide-session-dir as TWO tokens with a '
+                                      'path outside the tests directory does exactly that: pytest '
+                                      'resolves rootdir before it knows the option, counts the '
+                                      'value as a path argument, and moves rootdir up to the '
+                                      'common ancestor. Deliver the directory as '
+                                      'TESTHIDE_SESSION_DIR (immune), or write '
+                                      '--testhide-session-dir=PATH as one token (also immune). '
+                                      'Measured on pytest 9.1.1.')
+                            else:
+                                print('[testhide]   this session collected NOTHING; check the '
+                                      'paths the executor was started with')
+                            break
+                else:
+                    unknown_file_waves = 0
 
                 # A poisoned session is FAST, and that is what makes it dangerous.
                 #
@@ -1094,18 +1235,29 @@ class _WaveRunner:
                 # suite into errors on one bad machine — the tests are fine, the report is not, and
                 # the fastest worker on the farm is the broken one.
                 #
-                # Two consecutive all-error waves, not one: a single wave can legitimately be all
-                # errors when a batch happens to land entirely inside one broken class.
+                # Counted in TESTS, and only across two waves or more. The threshold has to be in
+                # the same units as the evidence, and the evidence is "a fixture that will never
+                # work again errors every test it touches". A wave is ONE test by default — every
+                # writer of max_tests_per_one_execute defaults it to 1 — so a wave-counted
+                # threshold of two meant two adjacent erroring tests, which is what a single
+                # ordinary broken class fixture looks like. Measured before the change: four
+                # single-test waves with a fixture broken for the first two ended the session and
+                # the two healthy tests were never served. The wave floor stays, because one large
+                # batch can land entirely inside one broken class and say nothing about the
+                # session's health.
                 if results and all(r['outcome'] == 'error' for r in results):
                     all_error_waves += 1
-                    if all_error_waves >= _MAX_ALL_ERROR_WAVES:
-                        print('[testhide] %d consecutive waves errored on every test; this session '
+                    error_streak_tests += len(results)
+                    if (all_error_waves >= _MIN_ALL_ERROR_WAVES
+                            and error_streak_tests >= _MAX_ALL_ERROR_TESTS):
+                        print('[testhide] %d tests in a row errored, across %d waves; this session '
                               'is not going to recover (pytest caches a failed fixture and never '
                               'retries it), ending it so the queue goes to a healthy executor'
-                              % all_error_waves)
+                              % (error_streak_tests, all_error_waves))
                         break
                 else:
                     all_error_waves = 0
+                    error_streak_tests = 0
 
                 if session.shouldfail:
                     print('[testhide] session stopping early: %s' % session.shouldfail)
@@ -1115,13 +1267,42 @@ class _WaveRunner:
                     break
                 n += 1
         finally:
+            self._end_session(session, held_item)
             session.config.pluginmanager.unregister(self)
-            # The one place the session itself unwinds. Guarded: a teardown that raises here must
-            # not turn a completed run into an INTERNALERROR.
-            try:
+
+    def _end_session(self, session, held_item):
+        """Unwind the session, and let a failure in THAT be a result rather than a printed line.
+
+        The last item of the last wave has the same deferred teardown every wave boundary has, but
+        no boundary after it to run in. Unwinding with a bare teardown_exact(None) inside a
+        try/except print meant the exception never became a report: not in the junit, not in
+        session.testsfailed, not in the exit code. Measured against vanilla on the same file —
+        vanilla rc=1 "4 passed, 1 error", waves rc=0 "4 passed", the only trace a stdout line glued
+        into the middle of the progress bar. Since the boundary sentinel deliberately holds the
+        class, module and session open, this deferred teardown is non-empty in EVERY session.
+
+        Re-attributed to the item that owned the fixture, exactly as a boundary does, and published
+        to `session-ended.json` — which doubles as the end-of-session marker the protocol lacked, so
+        a client can tell "the session finished" from "the process died".
+        """
+        amended = []
+        try:
+            if held_item is None:
                 session._setupstate.teardown_exact(None)
-            except Exception as exc:
-                print('[testhide] error during final teardown: %r' % (exc,))
+            else:
+                self._boundary_teardown(session, None, held_item)
+                row = self._amend(held_item.nodeid)
+                if row is not None:
+                    amended.append(row)
+        except Exception as exc:
+            # Reached only when there is no item to attribute the failure to, so there is nothing
+            # to publish it against. Still guarded: a teardown that raises must not turn a
+            # completed run into an INTERNALERROR.
+            print('[testhide] error during final teardown: %r' % (exc,))
+        try:
+            self._write_json('session-ended.json', {'amended': amended})
+        except OSError as exc:
+            print('[testhide] could not write the session end marker: %r' % (exc,))
 
 
 def _session_control_dir(config):
@@ -1195,6 +1376,8 @@ def pytest_configure(config):
     #     -x left in      0/2 waves completed; the session died and wave 1 was never even delivered
     if _session_control_dir(config):
         config.option.testhide_batch = True
+        # Before collection, which is the only time this can be observed.
+        config.pluginmanager.register(_BrokenCollectors(), 'testhide_broken_collectors')
 
     # Before the --report-xml gate below: a batch must be neutralised whether or not this run also
     # produces a report.

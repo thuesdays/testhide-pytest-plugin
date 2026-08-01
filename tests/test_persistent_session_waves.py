@@ -396,22 +396,24 @@ def test_a_broken_module_serves_waves_even_without_continue_on_collection_errors
     result.stdout.fnmatch_lines(["*collection error*serving waves anyway*"])
 
 
-def test_a_wave_with_nothing_collectable_ends_the_session(pytester):
-    """A wave where NOT ONE nodeid is visible is not a broken test file — a broken file leaves its
-    siblings collectable. It is a session whose scope does not cover what it is being assigned: an
-    executor started on one file, or in a different rootdir, than the queue was built from.
+def test_a_wave_naming_a_file_this_session_never_collected_ends_it_after_two(pytester):
+    """A wave where not one nodeid is visible AND the FILE is unknown is a session whose scope does
+    not cover what it is being assigned: an executor started on one file, or in a different rootdir,
+    than the queue was built from.
 
-    Every later wave would return the same empty answer, so serving them means holding a node while
+    Every later wave returns the same empty answer, so serving them means holding a node while
     reporting nothing, indefinitely. Ending lets the sweep give the work to a healthy executor.
+
+    Two waves, not one — see the test below for the half that costs more than it saves.
     """
     pytester.makepyfile(test_suite=SUITE)
     control = pytester.path / "control"
     control.mkdir()
 
-    # 3s, not the default 20: wave 1 is expected NEVER to report, and paying the full
+    # 3s, not the default 20: wave 2 is expected NEVER to report, and paying the full
     # regression deadline for an outcome the test WANTS would put 20 idle seconds in
     # every run of this suite.
-    feeder = _feed(control, [["nowhere.py::test_a", "nowhere.py::test_b"], A[:2]],
+    feeder = _feed(control, [["nowhere.py::test_a"], ["nowhere.py::test_b"], A[:2]],
                    deadline=3.0)
     result = pytester.runpytest_subprocess(
         "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
@@ -419,10 +421,69 @@ def test_a_wave_with_nothing_collectable_ends_the_session(pytester):
 
     done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
     assert done0["results"] == []
-    assert len(done0["not_collected"]) == 2
-    assert not (control / "wave-1.done.json").exists(), (
+    assert done0["not_collected"] == ["nowhere.py::test_a"]
+    assert (control / "wave-1.done.json").exists()
+    assert not (control / "wave-2.done.json").exists(), (
         "the session kept serving waves it cannot answer")
-    result.stdout.fnmatch_lines(["*no collectable tests at all*"])
+    result.stdout.fnmatch_lines(["*does not know*", "*waves in a row named files*"])
+
+
+def test_a_single_renamed_nodeid_does_not_end_a_one_test_per_wave_session(pytester):
+    """The rule above, expressed in WAVES, degenerated into "any total miss is fatal" — because a
+    wave is `max_tests_per_one_execute` tests and every writer of that setting defaults it to 1.
+
+    So one renamed or deleted test, the ordinary case the partial-miss branch exists for, ended the
+    whole persistent session, and every batch that executor still held went unanswered. Measured
+    before the fix on exactly these four waves: waves 2 and 3 had no done file at all and the run
+    reported "1 passed". The partial-miss test next to this one uses two-nodeid waves and therefore
+    could not see it.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [[A[0]], ["test_suite.py::TestA::test_renamed"], [A[1]], [A[2]]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    for n in (2, 3):
+        assert (control / ("wave-%d.done.json" % n)).exists(), (
+            "one renamed test ended the session; wave %d was never served" % n)
+    result.assert_outcomes(passed=3)
+    result.stdout.fnmatch_lines(["*the file is collected but the test is not*"])
+
+
+def test_a_wave_entirely_inside_a_broken_module_does_not_end_the_session(pytester):
+    """The rule's premise — "a broken file leaves its siblings collectable, so a TOTAL miss must be
+    a scope mismatch" — is false whenever a batch lands inside the broken file. Batches are
+    contiguous slices of a discovery-ordered queue, so that is not a corner case; at the default
+    batch of one it happens on the FIRST nodeid of the broken file.
+
+    Worse than ending: the diagnosis printed was about rootdir and the shape of the
+    --testhide-session-dir token, which is the wrong place to send whoever reads it. The collection
+    error is right there in the same log.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    pytester.makepyfile(test_broken="import totally_missing_module_xyz\n\n"
+                                    "def test_x(): pass\ndef test_y(): pass\n")
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [A[:2],
+                             ["test_broken.py::test_x", "test_broken.py::test_y"],
+                             A[2:]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "test_broken.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-2.done.json").exists(), (
+        "a batch inside a broken module took the whole executor down")
+    done2 = json.loads((control / "wave-2.done.json").read_text(encoding="utf-8"))
+    assert [r["nodeid"] for r in done2["results"]] == A[2:]
+    result.stdout.fnmatch_lines(["*COLLECTION FAILED*test_broken.py*"])
+    assert "nodeids are relative to rootdir" not in result.stdout.str(), (
+        "the operator was sent to look at rootdir for what is an import error")
 
 
 def test_a_partial_miss_is_not_fatal(pytester):
@@ -557,13 +618,14 @@ def test_the_nothing_collectable_message_names_the_rootdir_cause(pytester):
     control = pytester.path / "control"
     control.mkdir()
 
-    feeder = _feed(control, [["wrong/prefix/test_suite.py::TestA::test_1"]], deadline=3.0)
+    feeder = _feed(control, [["wrong/prefix/test_suite.py::TestA::test_1"],
+                             ["wrong/prefix/test_suite.py::TestA::test_2"]], deadline=3.0)
     result = pytester.runpytest_subprocess(
         "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
     feeder.join(timeout=30)
 
     result.stdout.fnmatch_lines([
-        "*no collectable tests at all*",
+        "*waves in a row named files this session never collected*",
         "*rootdir:*",
         "*this session collected ids like:*",
         "*the wave asked for:*",
@@ -580,13 +642,7 @@ POISONED = """
     def app():
         raise RuntimeError("steam login failed")
 
-    def test_1(): pass
-    def test_2(): pass
-    def test_3(): pass
-    def test_4(): pass
-    def test_5(): pass
-    def test_6(): pass
-"""
+""" + "".join("    def test_%d(): pass\n" % i for i in range(1, 31))
 
 
 def test_a_session_whose_fixture_died_stops_asking_for_work(pytester):
@@ -603,9 +659,9 @@ def test_a_session_whose_fixture_died_stops_asking_for_work(pytester):
     pytester.makepyfile(test_suite=POISONED)
     control = pytester.path / "control"
     control.mkdir()
-    ids = ["test_suite.py::test_%d" % i for i in range(1, 7)]
+    ids = ["test_suite.py::test_%d" % i for i in range(1, 31)]
 
-    feeder = _feed(control, [ids[0:2], ids[2:4], ids[4:6]], deadline=3.0)
+    feeder = _feed(control, [ids[0:10], ids[10:20], ids[20:30]], deadline=3.0)
     pytester.runpytest_subprocess(
         "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
     feeder.join(timeout=30)
@@ -617,6 +673,44 @@ def test_a_session_whose_fixture_died_stops_asking_for_work(pytester):
 
     done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
     assert all(r["outcome"] == "error" for r in done1["results"])
+
+
+def test_two_adjacent_single_test_error_waves_do_not_end_a_healthy_session(pytester):
+    """The detector counted WAVES and reasoned about batches ("a batch can land entirely inside one
+    broken class"), but the wave size it was calibrated against is a job setting the plugin cannot
+    see, and every writer of it defaults to 1. So the threshold in practice was "two erroring tests
+    in a row" — which is one ordinary broken class fixture shared by two neighbouring tests, not a
+    session that will never recover.
+
+    Measured before the fix on exactly these four waves: the session ended after wave 1 and the two
+    healthy tests were never served. The two existing tests could not see it: one uses two-nodeid
+    waves, the other alternates bad/ok specifically so the reset fires.
+    """
+    pytester.makepyfile(test_suite="""
+        import pytest
+
+        @pytest.fixture
+        def broken():
+            raise RuntimeError("one shared class fixture")
+
+        def test_bad_1(broken): pass
+        def test_bad_2(broken): pass
+        def test_ok_3(): pass
+        def test_ok_4(): pass
+    """)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["test_suite.py::test_bad_1"], ["test_suite.py::test_bad_2"],
+                             ["test_suite.py::test_ok_3"], ["test_suite.py::test_ok_4"]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    for n in (2, 3):
+        assert (control / ("wave-%d.done.json" % n)).exists(), (
+            "two erroring tests ended a session with healthy work left; wave %d unserved" % n)
+    result.assert_outcomes(passed=2, errors=2)
 
 
 def test_one_all_error_wave_is_not_enough_to_give_up(pytester):
@@ -682,3 +776,293 @@ def test_all_error_waves_have_to_be_CONSECUTIVE(pytester):
         "non-consecutive all-error waves ended a session that was still working")
     done3 = json.loads((control / "wave-3.done.json").read_text(encoding="utf-8"))
     assert done3["results"][0]["outcome"] == "passed"
+
+
+# ---------------------------------------------------------------- a failure must never arrive
+#                                                                   as a pass
+
+LATE_TEARDOWN = """
+    import pytest
+
+    class TestA:
+        @pytest.fixture(scope="class", autouse=True)
+        def heavy(self):
+            yield
+            raise RuntimeError("steam logout failed")
+
+        def test_1(self): pass
+        def test_2(self): pass
+
+    class TestB:
+        def test_3(self): pass
+"""
+
+
+def _rows(payload, key):
+    return {r["nodeid"]: r["outcome"] for r in (payload.get(key) or [])}
+
+
+def test_a_class_teardown_error_after_a_waves_last_test_is_published_as_an_amendment(pytester):
+    """The one direction that must never happen: a failure arriving as a pass.
+
+    The last item of a wave is run with a sentinel for `nextitem` that deliberately keeps its class,
+    module and session alive across the boundary — that IS the feature. So its class teardown runs
+    one wave later, after the wave that owned it has already published `passed` and frozen it in a
+    done file the client has read.
+
+    Before this, the corrected verdict was logged into a `_wave_reports` dict that the very next
+    line cleared, so it reached nothing: the terminal said "3 passed, 1 error", every done file said
+    passed, the synthesised junit carried no <error>, and the build was green. At the default batch
+    of one this is the LAST test of every wave, which is every test.
+    """
+    pytester.makepyfile(test_suite=LATE_TEARDOWN)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    ids = ["test_suite.py::TestA::test_1", "test_suite.py::TestA::test_2",
+           "test_suite.py::TestB::test_3"]
+    feeder = _feed(control, [[ids[0]], [ids[1]], [ids[2]]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done = [json.loads((control / ("wave-%d.done.json" % n)).read_text(encoding="utf-8"))
+            for n in range(3)]
+
+    # The class ends when wave 2 asks for TestB, so that is where the correction appears.
+    assert _rows(done[2], "amended") == {ids[1]: "error"}, (
+        "the class teardown failure never reached the wave protocol: %r" % done[2])
+    # ...and nowhere else, because nothing else changed.
+    assert done[0]["amended"] == [] and done[1]["amended"] == []
+    # The published verdict for test_2 was passed. Both statements are true at once; that is
+    # precisely why the amendment channel has to exist rather than the row being rewritten.
+    assert _rows(done[1], "results") == {ids[1]: "passed"}
+    result.assert_outcomes(passed=3, errors=1)
+
+
+def test_a_teardown_error_on_the_FINAL_wave_is_not_swallowed(pytester):
+    """The last item of the LAST wave has the same deferred teardown and no boundary left to run in.
+
+    It used to unwind under a bare `except Exception: print(...)`, so the exception became a line of
+    stdout glued into the middle of the progress bar and nothing else: no report, no
+    session.testsfailed, no exit code. Measured against vanilla on this file — vanilla rc=1
+    "2 passed, 1 error", waves rc=0 "2 passed".
+    """
+    pytester.makepyfile(test_suite=LATE_TEARDOWN)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    ids = ["test_suite.py::TestA::test_1", "test_suite.py::TestA::test_2"]
+    feeder = _feed(control, [[ids[0]], [ids[1]]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    ended = control / "session-ended.json"
+    assert ended.exists(), "the session published no end marker at all"
+    assert _rows(json.loads(ended.read_text(encoding="utf-8")), "amended") == {ids[1]: "error"}
+    result.assert_outcomes(passed=2, errors=1)
+    assert result.ret == 1, "a session that ended on an error reported success"
+
+
+def test_the_session_end_marker_is_written_even_when_nothing_failed(pytester):
+    """It is the marker, not the error channel: a client has to be able to tell "the session
+    finished" from "the process died", and an end file that only appears on failure cannot."""
+    _, done = run_waves(pytester, [A[:2], A[2:]])
+    control = pytester.path / "control"
+
+    ended = control / "session-ended.json"
+    assert ended.exists()
+    assert json.loads(ended.read_text(encoding="utf-8"))["amended"] == []
+    assert all(d is not None for d in done)
+
+
+def test_a_function_scoped_teardown_error_lands_in_ITS_OWN_wave(pytester):
+    """Only class, module and session teardown genuinely has to wait for the next wave. The item's
+    own function-scoped teardown does not, and vanilla runs it between two tests of the same class.
+
+    The boundary sentinel used to hold the finished item's FULL chain, which pops nothing — so this
+    ordinary case was deferred too, and a per-test cleanup that fails was published as a pass by the
+    wave that ran it. Trimming the sentinel's chain to everything ABOVE the item restores parity
+    with vanilla and leaves only the genuinely-undecidable scopes to the amendment channel.
+    """
+    pytester.makepyfile(test_suite="""
+        import pytest
+
+        @pytest.fixture
+        def fn():
+            yield
+            raise RuntimeError("per-test cleanup failed")
+
+        def test_1(fn): pass
+        def test_2(): pass
+    """)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["test_suite.py::test_1"], ["test_suite.py::test_2"]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
+    assert _rows(done0, "results") == {"test_suite.py::test_1": "error"}, (
+        "the test's own teardown was deferred past its verdict: %r" % done0)
+    result.assert_outcomes(passed=2, errors=1)
+
+
+# ---------------------------------------------------------------- a nodeid handed over twice
+
+REPEATABLE = """
+    import os
+    import pytest
+
+    _N = [0]
+
+    @pytest.fixture
+    def res():
+        return "ok"
+
+    def test_flaky(res):
+        _N[0] += 1
+        open(os.path.join(os.path.dirname(__file__), "ran-%d.marker" % _N[0]), "a").close()
+        assert res == "ok"
+"""
+
+
+def _ran(pytester):
+    return len(list(pytester.path.glob("ran-*.marker")))
+
+
+def test_the_same_nodeid_in_two_consecutive_waves_runs_twice_and_passes_twice(pytester):
+    """A healthy test handed to a live session twice must run twice and pass twice.
+
+    The precondition is already in the backend: reclaim_dead_executors $pushes a dead child's
+    running list back to the queue without $addToSet, so two concurrent reclaims of one child leave
+    the id twice, and the assignment step hands it out as a flat slice. At the default batch of one
+    that is two consecutive single-nodeid waves into the same session.
+
+    Measured before the fix: wave 0 passed, wave 1 FAILED with `KeyError: 'res'`, and the test body
+    never ran at all — the item was still on the setup stack, so pytest saw nothing to set up and
+    the fixture was never re-created.
+    """
+    pytester.makepyfile(test_suite=REPEATABLE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    nid = "test_suite.py::test_flaky"
+    feeder = _feed(control, [[nid], [nid]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    for n in (0, 1):
+        done = json.loads((control / ("wave-%d.done.json" % n)).read_text(encoding="utf-8"))
+        assert _rows(done, "results") == {nid: "passed"}, "wave %d: %r" % (n, done)
+    assert _ran(pytester) == 2, "the test body ran %d times, not twice" % _ran(pytester)
+    result.assert_outcomes(passed=2)
+
+
+def test_a_nodeid_repeated_inside_ONE_wave_does_not_clobber_its_own_verdict(pytester):
+    """Results are keyed by nodeid, so a duplicate inside one wave publishes ONE row for TWO runs —
+    the second overwriting the first. Measured before the fix: pytest reported "1 failed, 1 passed"
+    and the done file reported the nodeid as failed, i.e. a good run was published as the failure of
+    its own duplicate. Deduplicating the wave is the only reading that can be reported honestly."""
+    pytester.makepyfile(test_suite=REPEATABLE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    nid = "test_suite.py::test_flaky"
+    feeder = _feed(control, [[nid, nid]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
+    assert len(done0["results"]) == 1
+    assert _rows(done0, "results") == {nid: "passed"}
+    assert _ran(pytester) == 1
+    result.assert_outcomes(passed=1)
+
+
+# ---------------------------------------------------------------- the loop cannot be trapped
+
+def test_an_unparseable_wave_file_still_honours_stop(pytester):
+    """`stop` and the idle deadline sat BELOW the "does the wave file exist?" branch, and the
+    unparseable case ended in `continue`. So a wave-N.json that exists and never parses re-entered
+    that branch every iteration and both exits were unreachable: the executor spun at 50Hz holding
+    its node until the build timed out. Measured with the idle deadline set to 2s — still alive at
+    20s, killed at 25s.
+
+    Not reachable through our own client, which renames into place; reachable through a leftover in
+    a reused control directory, a hand-edited file, or wave-N.json being a directory.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+    (control / "wave-0.json").write_text('{"nodeids": ["test_suite.py::tes', encoding="utf-8")
+    (control / "stop").write_text("", encoding="utf-8")
+
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=40)
+
+    assert result.ret == 0
+    assert not (control / "wave-0.done.json").exists()
+
+
+def test_looponfail_is_disarmed_for_a_SESSION_too(pytester, monkeypatch):
+    """xdist implements -f in pytest_cmdline_main, which never returns: it re-runs failures forever.
+    The guard against it is the only door that cannot be closed from pytest_configure — and it was
+    reading a flag that pytest_configure is what SETS.
+
+    Measured against pytest 9.1.1: `_pytest.main.pytest_cmdline_main` IS `wrap_session(config,
+    _main)`, and `_do_configure()` is called by wrap_session. So configure runs INSIDE this hook,
+    strictly after the tryfirst guard has read the flag and returned. A session-mode run with -f
+    never returned and had to be killed at 25s, holding its node and reporting nothing — with the
+    directory delivered either way, env var or option. The existing neutralisation test passes
+    --testhide-batch explicitly, which is the one spelling that already worked.
+    """
+    pytest.importorskip("xdist")
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+    (control / "stop").write_text("", encoding="utf-8")
+    monkeypatch.setenv("TESTHIDE_SESSION_DIR", str(control))
+
+    result = pytester.runpytest_subprocess("test_suite.py", "-f", timeout=40)
+
+    assert result.ret == 0
+    result.stdout.fnmatch_lines(["*ignoring -f/--looponfail*"])
+
+
+# ---------------------------------------------------------------- the numbers are real numbers
+
+def test_a_slow_test_reports_a_larger_duration_than_a_fast_one(pytester):
+    """The only assertion about durations was `"duration" in r`, which is true of a key written
+    unconditionally — measured: replacing the value with a literal 0.0 left the whole suite green.
+    Every other test that touches a duration hands the reader a ready-made number, so none of them
+    can fail on a producer that emits zero.
+
+    Durations are what the scheduler orders batches by, so a producer that quietly emits zero
+    degrades longest-processing-time ordering to collection order with nothing to show for it.
+    """
+    pytester.makepyfile(test_suite="""
+        import time
+
+        def test_slow(): time.sleep(0.3)
+        def test_fast(): pass
+    """)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["test_suite.py::test_slow", "test_suite.py::test_fast"]])
+    pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
+    by_id = {r["nodeid"]: r["duration"] for r in done0["results"]}
+    slow = by_id["test_suite.py::test_slow"]
+    fast = by_id["test_suite.py::test_fast"]
+    assert slow > 0.2, "the slow test reported %r" % slow
+    assert slow > fast * 10, "slow=%r fast=%r" % (slow, fast)
