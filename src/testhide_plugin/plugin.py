@@ -1042,10 +1042,24 @@ class _WaveRunner:
 
                 if not_collected:
                     # Loud, because the alternative is a nodeid that was assigned and simply never
-                    # spoken of again. The usual cause is an executor started with a narrower scope
-                    # than the batches it is being given.
+                    # spoken of again.
                     print('[testhide] wave %d: %d nodeid(s) not collected in this session: %s'
                           % (n, len(not_collected), ', '.join(not_collected[:5])))
+
+                if not_collected and not items:
+                    # NOTHING in this wave was visible. That is not a broken test file — a broken
+                    # file leaves its siblings collectable — it is a session whose scope does not
+                    # cover what it is being assigned: an executor started on one file, or on a
+                    # different rootdir, than the queue was built from. Every later wave would
+                    # produce the same empty answer, so serving them means holding a node while
+                    # reporting nothing, forever.
+                    #
+                    # A PARTIAL miss is deliberately NOT fatal. That is the broken-module case, and
+                    # ending there would stop an executor that is still running every other test
+                    # correctly — the healthy nodeids in this very wave just reported.
+                    print('[testhide] wave %d had no collectable tests at all; this session cannot '
+                          'serve the queue it is being given, ending it' % n)
+                    break
 
                 if session.shouldfail:
                     print('[testhide] session stopping early: %s' % session.shouldfail)
@@ -1105,6 +1119,17 @@ def pytest_runtestloop(session):
         print('[testhide] %d collection error(s); serving waves anyway so assigned tests still '
               'report. Tests in the affected files will come back as not collected.'
               % session.testsfailed)
+
+    # Say so ourselves rather than relying on the instance hook at :564 having already run.
+    #
+    # Both implementations are tryfirst on a firstresult hook, and this one returns True — so the
+    # published report depends on pluggy calling them in the order it happens to call them today.
+    # If that order ever flipped, `_session_executed_tests` would see a session that "never entered
+    # the run loop" and pytest_sessionfinish would DISCARD the whole report: every wave's results,
+    # gone, on a run where every test passed. An assumption that silent should not be load-bearing.
+    reporter = session.config.pluginmanager.get_plugin('testhide_plugin_active')
+    if reporter is not None:
+        reporter._runtestloop_entered = True
 
     _WaveRunner(control_dir).run(session)
     return True

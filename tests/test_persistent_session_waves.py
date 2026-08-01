@@ -80,7 +80,7 @@ def _paid(pytester, name):
 _WAVE_REPORT_DEADLINE = 20.0
 
 
-def _feed(control, waves, delay=0.0):
+def _feed(control, waves, delay=0.0, deadline=None):
     """Hand the live session one wave at a time, the way the client will: write the next wave only
     after the previous one has reported, then stop."""
     def worker():
@@ -89,9 +89,9 @@ def _feed(control, waves, delay=0.0):
             tmp = control / ("wave-%d.tmp" % n)
             tmp.write_text(json.dumps({"nodeids": wave}), encoding="utf-8")
             os.replace(str(tmp), str(control / ("wave-%d.json" % n)))
-            deadline = time.time() + _WAVE_REPORT_DEADLINE
+            wait_until = time.time() + (deadline or _WAVE_REPORT_DEADLINE)
             while not (control / ("wave-%d.done.json" % n)).exists():
-                if time.time() > deadline:
+                if time.time() > wait_until:
                     break
                 time.sleep(0.01)
         (control / "stop").write_text("", encoding="utf-8")
@@ -394,3 +394,141 @@ def test_a_broken_module_serves_waves_even_without_continue_on_collection_errors
     assert (control / "wave-0.done.json").exists(), "the executor died at collection"
     assert (control / "wave-1.done.json").exists()
     result.stdout.fnmatch_lines(["*collection error*serving waves anyway*"])
+
+
+def test_a_wave_with_nothing_collectable_ends_the_session(pytester):
+    """A wave where NOT ONE nodeid is visible is not a broken test file — a broken file leaves its
+    siblings collectable. It is a session whose scope does not cover what it is being assigned: an
+    executor started on one file, or in a different rootdir, than the queue was built from.
+
+    Every later wave would return the same empty answer, so serving them means holding a node while
+    reporting nothing, indefinitely. Ending lets the sweep give the work to a healthy executor.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    # 3s, not the default 20: wave 1 is expected NEVER to report, and paying the full
+    # regression deadline for an outcome the test WANTS would put 20 idle seconds in
+    # every run of this suite.
+    feeder = _feed(control, [["nowhere.py::test_a", "nowhere.py::test_b"], A[:2]],
+                   deadline=3.0)
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
+    assert done0["results"] == []
+    assert len(done0["not_collected"]) == 2
+    assert not (control / "wave-1.done.json").exists(), (
+        "the session kept serving waves it cannot answer")
+    result.stdout.fnmatch_lines(["*no collectable tests at all*"])
+
+
+def test_a_partial_miss_is_not_fatal(pytester):
+    """The other half of the same rule, and the reason it is not simply "any miss ends it": one
+    renamed or deleted test must not stop an executor that is running everything else correctly."""
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [A[:1] + ["gone.py::test_x"], A[1:]])
+    pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-1.done.json").exists(), "a single missing nodeid ended the session"
+    done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
+    assert [r["nodeid"] for r in done1["results"]] == A[1:]
+    assert _paid(pytester, "class-A") == 1
+
+
+# --------------------------------------------------------------- the report still gets published
+
+def test_the_junit_report_carries_every_wave(pytester):
+    """The junit is still assembled once, at session finish — waves do not change that. What they
+    DO change is that the session must be recognised as one that ran tests: the guard that stops a
+    --collect-only run from replacing a real report with tests="0" is the same guard that would
+    discard this one.
+
+    Two implementations of pytest_runtestloop are involved and both are tryfirst on a firstresult
+    hook, so before this test the published report depended on the order pluggy happens to call
+    them in. Every wave passing and the report vanishing is not a failure anyone would look for.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [A[:2], A[2:] + B])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control),
+        "--report-xml", "junittests.xml", timeout=120)
+    feeder.join(timeout=30)
+
+    result.assert_outcomes(passed=5)
+    report = pytester.path / "junittests.xml"
+    assert report.exists(), "the report was discarded"
+
+    import xml.etree.ElementTree as ET
+    cases = {c.get("name") for c in ET.parse(str(report)).getroot().iter("testcase")}
+    assert len(cases) == 5, "the report has %d cases, not 5: %r" % (len(cases), cases)
+
+
+def test_the_wave_loop_marks_the_session_itself(pytester):
+    """Driven directly, because the end-to-end test above cannot distinguish it.
+
+    Two implementations of pytest_runtestloop are tryfirst on a firstresult hook. Today pluggy calls
+    the instance one first, so it sets the flag and the report survives — which means deleting the
+    line below leaves the whole suite green (measured). That is an ordering the tests cannot see,
+    and the cost of it changing is the entire report being discarded on a run where everything
+    passed. So the line is asserted where it can be: on the function itself.
+    """
+    from testhide_plugin import plugin as tp
+
+    class _Reporter:
+        _runtestloop_entered = False
+
+    class _PM:
+        def __init__(self, reporter):
+            self._r = reporter
+
+        def get_plugin(self, name):
+            return self._r if name == "testhide_plugin_active" else None
+
+        def register(self, *a, **k):
+            return None
+
+        def unregister(self, *a, **k):
+            return None
+
+    control = pytester.path / "ctl"
+    control.mkdir()
+    (control / "stop").write_text("", encoding="utf-8")      # end immediately
+
+    reporter = _Reporter()
+
+    class _Opt:
+        testhide_session_dir = str(control)
+        collectonly = False
+        continue_on_collection_errors = False
+
+    class _Cfg:
+        option = _Opt()
+        pluginmanager = _PM(reporter)
+
+    class _SetupState:
+        def teardown_exact(self, nextitem):
+            return None
+
+    class _Session:
+        config = _Cfg()
+        testsfailed = 0
+        items = []
+        shouldfail = False
+        shouldstop = False
+        _setupstate = _SetupState()
+
+    assert tp.pytest_runtestloop(_Session()) is True
+    assert reporter._runtestloop_entered is True, (
+        "the wave loop left the session marked as one that never ran tests — "
+        "pytest_sessionfinish would discard the report")
