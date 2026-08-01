@@ -4,3 +4,7 @@ dist/
 src/testhide_pytest_plugin.egg-info/
 .idea/
 src/testhide_plugin/__pycache__/
+
+# Test bytecode (any pytest/python version)
+__pycache__/
+*.py[cod]

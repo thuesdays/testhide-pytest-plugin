@@ -79,7 +79,10 @@ class TesthidePlugin:
         ])
         self.jira = None
         self._merged = False
-        
+        # D-0801: set by pytest_runtestloop. See _session_executed_tests — the report may only be
+        # replaced by a session that actually entered the run loop.
+        self._runtestloop_entered = False
+
         if self.is_xdist_master:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(sig, self._signal_flush)
@@ -557,25 +560,79 @@ class TesthidePlugin:
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
     
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtestloop(self, session):
+        """Record that this session reached the run loop. Returns None so the real loop still runs.
+
+        tryfirst matters: pytest_runtestloop is firstresult=True, so an implementation that returns
+        a value (pytest's own, xdist's DSession) ends the call and everything after it is skipped.
+        """
+        self._runtestloop_entered = True
+        return None
+
+    def _session_executed_tests(self, session) -> bool:
+        """Did this session actually run the test protocol?
+
+        Only such a session is allowed to replace the report. Anything else reaches
+        pytest_sessionfinish with an empty temp dir and would os.replace() the last real
+        junittests.xml with a document containing tests="0".
+
+        The first version of this guard whitelisted --collect-only alone. That was wrong: pytest
+        calls wrap_session — and therefore both session hooks — from FOUR places, and three of them
+        run a full session that executes nothing:
+            _pytest/main.py          _main                    (a real run)
+            _pytest/fixtures.py      _showfixtures_main       (--fixtures)
+            _pytest/fixtures.py      _show_fixtures_per_test  (--fixtures-per-test)
+            _pytest/cacheprovider.py cacheshow                (--cache-show)
+        Measured against a workspace holding a real tests="3" report, each of the last three left
+        tests="0" — the same data loss, through a door the mode whitelist did not cover, on pytest
+        7.4.4 and 9.0.3 alike. Whitelisting a mode is a per-door fix and every new pytest mode
+        opens another door, so this asserts the property instead.
+
+        Two independent signals, because neither alone is sufficient:
+          - --fixtures / --fixtures-per-test / --cache-show never enter the run loop at all, so the
+            flag catches them (and any future listing mode built the same way).
+          - --collect-only, --setup-only and --setup-plan DO enter the run loop, so they have to be
+            named. --setup-only/--setup-plan matter more than they look: they run the setup and
+            teardown phases without `call`, so pytest_runtest_logreport sees passing SETUP reports
+            and the plugin records test_resolution="Passed". A dry run that executed no test body
+            published a fully green report for a suite whose every test fails. That is worse than
+            tests="0", which at least looks wrong.
+
+        A real run that collects zero tests deliberately returns True: it entered the loop and
+        genuinely produced no results, so writing tests="0" is the honest outcome. Keeping the
+        previous report there would attribute the LAST build's results to this one.
+        """
+        opt = session.config.option
+        for dry_run_flag in ("collectonly", "setuponly", "setupplan"):
+            if getattr(opt, dry_run_flag, False):
+                return False
+        return self._runtestloop_entered
+
+    def _discard_temp_dir(self):
+        """Drop the temp dir without merging it.
+
+        _merge_temp_dir_into_final() removes it as its last statement, so skipping the merge also
+        skipped the cleanup and every non-executing run left a `.junittests.xml_temp/` behind. The
+        next real run's pytest_sessionstart rmtree's it, so it is self-healing for a fixed report
+        name — but a job whose report name varies per build (--report-xml=junit_build17.xml) leaves
+        one directory per build that nothing ever collects.
+        """
+        try:
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except Exception:
+            # Never let cleanup failure change the exit status of a build.
+            pass
+
     def pytest_sessionfinish(self, session):
         """
         Finalizes the report. Only the master node will merge all temporary files.
         The entire merge and write process is protected by a file lock.
         """
-        # D-0801: a collect-only run must never touch the report.
-        #
-        # pytest_sessionfinish fires for --collect-only exactly as it does for a real run, but no
-        # test executed, so temp_dir is empty. The merge below then os.replace()s the existing
-        # junittests.xml with a document containing tests="0" — destroying the last real report.
-        #
-        # Measured: RUN 1 (normal) wrote 8 cases; RUN 2 (--collect-only, SAME --report-xml path)
-        # left tests="0". This bites today for anyone who runs --collect-only with --report-xml,
-        # and it is load-bearing for the upcoming TPS discovery pass, which reuses the job's own
-        # build script — and therefore its --report-xml argument — verbatim.
-        #
-        # Guarded here rather than by clearing report_xml earlier, because that alternative is
-        # sensitive to plugin registration order and was observed to fail when the order reversed.
-        if getattr(session.config.option, "collectonly", False):
+        if not self._session_executed_tests(session):
+            if self.is_xdist_master:
+                self._discard_temp_dir()
             return
 
         if self.is_xdist_master:
