@@ -922,17 +922,32 @@ def _owner_is_gone(control_dir, owner_pid):
         if os.name == 'nt':
             import ctypes
             SYNCHRONIZE, WAIT_OBJECT_0 = 0x00100000, 0
-            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(owner_pid))
+            ERROR_INVALID_PARAMETER = 87          # "no such process"
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(owner_pid))
             if not handle:
-                return True                       # cannot even open it: gone
+                # NOT "gone". OpenProcess also fails with ACCESS_DENIED for a process that is very
+                # much alive -- a SYSTEM agent queried from a session running as the console user is
+                # exactly that arrangement, and it is the arrangement this farm uses. Only the
+                # "no such process" error is evidence of death; every other failure means we could
+                # not tell, and the safe reading of "could not tell" is ALIVE. A false death
+                # abandons a running wave and hands its tests to another node; a false life costs
+                # one idle timeout.
+                return kernel32.GetLastError() == ERROR_INVALID_PARAMETER
             try:
-                return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
             finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        os.kill(int(owner_pid), 0)                # POSIX: signal 0 really is a probe
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(int(owner_pid), 0)            # POSIX: signal 0 really is a probe
+        except PermissionError:
+            return False                          # alive, just not ours to signal
         return False
-    except (OSError, ValueError, AttributeError):
+    except ProcessLookupError:
         return True
+    except (OSError, ValueError, AttributeError):
+        # Anything we could not evaluate is "unknown", and unknown must not kill a live session.
+        return False
 
 
 class _Chain:
