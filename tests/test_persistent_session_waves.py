@@ -569,3 +569,116 @@ def test_the_nothing_collectable_message_names_the_rootdir_cause(pytester):
         "*the wave asked for:*",
         "*nodeids are relative to rootdir*",
     ])
+
+
+# --------------------------------------------------------------- the poisoned session
+
+POISONED = """
+    import pytest
+
+    @pytest.fixture(scope="session", autouse=True)
+    def app():
+        raise RuntimeError("steam login failed")
+
+    def test_1(): pass
+    def test_2(): pass
+    def test_3(): pass
+    def test_4(): pass
+    def test_5(): pass
+    def test_6(): pass
+"""
+
+
+def test_a_session_whose_fixture_died_stops_asking_for_work(pytester):
+    """pytest caches a fixture's exception and never retries it, so a session whose session-scoped
+    fixture died once errors every test it is ever given — instantly. Measured:
+
+        wave 0   ['error', 'error']   0.245s   <- the fixture actually ran
+        wave 1   ['error', 'error']   0.038s   <- cached; nothing ran at all
+
+    38 milliseconds per wave, and then it asks for more. Against a FIFO queue this executor
+    out-competes every healthy node and turns the whole suite into errors on one bad machine: the
+    tests are fine, the report is not, and the fastest worker on the farm is the broken one.
+    """
+    pytester.makepyfile(test_suite=POISONED)
+    control = pytester.path / "control"
+    control.mkdir()
+    ids = ["test_suite.py::test_%d" % i for i in range(1, 7)]
+
+    feeder = _feed(control, [ids[0:2], ids[2:4], ids[4:6]], deadline=3.0)
+    pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-0.done.json").exists()
+    assert (control / "wave-1.done.json").exists()
+    assert not (control / "wave-2.done.json").exists(), (
+        "the poisoned session kept taking work")
+
+    done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
+    assert all(r["outcome"] == "error" for r in done1["results"])
+
+
+def test_one_all_error_wave_is_not_enough_to_give_up(pytester):
+    """A batch can legitimately land entirely inside one broken class, and the executor is fine.
+    Giving up on the first one would turn a local failure into a lost node."""
+    pytester.makepyfile(test_suite="""
+        import pytest
+
+        @pytest.fixture
+        def broken():
+            raise RuntimeError("just this one")
+
+        def test_a(broken): pass
+        def test_b(broken): pass
+        def test_c(): pass
+        def test_d(): pass
+    """)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["test_suite.py::test_a", "test_suite.py::test_b"],
+                             ["test_suite.py::test_c", "test_suite.py::test_d"]])
+    pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-1.done.json").exists(), "one bad batch ended a healthy session"
+    done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
+    assert all(r["outcome"] == "passed" for r in done1["results"])
+
+
+def test_all_error_waves_have_to_be_CONSECUTIVE(pytester):
+    """Found by mutation: without the reset, two all-error waves anywhere in a session end it.
+
+    A long suite can easily have one broken class early and another later, with healthy batches in
+    between. Treating those as a poisoned session takes a node that is doing its job and hands its
+    remaining work back to the queue — the false positive costs more than the detector saves.
+    """
+    pytester.makepyfile(test_suite="""
+        import pytest
+
+        @pytest.fixture
+        def broken():
+            raise RuntimeError("local")
+
+        def test_bad_1(broken): pass
+        def test_ok_1(): pass
+        def test_bad_2(broken): pass
+        def test_ok_2(): pass
+    """)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["test_suite.py::test_bad_1"],
+                             ["test_suite.py::test_ok_1"],
+                             ["test_suite.py::test_bad_2"],
+                             ["test_suite.py::test_ok_2"]])
+    pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-3.done.json").exists(), (
+        "non-consecutive all-error waves ended a session that was still working")
+    done3 = json.loads((control / "wave-3.done.json").read_text(encoding="utf-8"))
+    assert done3["results"][0]["outcome"] == "passed"

@@ -856,6 +856,9 @@ _WAVE_POLL_SEC = 0.02
 # this long doing nothing if the client dies without writing `stop`, so it is deliberately shorter
 # than the build-level timeouts that would otherwise be the only thing to notice.
 _WAVE_IDLE_TIMEOUT_SEC = 600.0
+# Consecutive waves where every single test errored before the session gives up. Two, not
+# one: a batch can legitimately land entirely inside one broken class.
+_MAX_ALL_ERROR_WAVES = 2
 
 
 class _WaveBoundary:
@@ -1005,6 +1008,7 @@ class _WaveRunner:
         by_id = {item.nodeid: item for item in session.items}
         boundary = _WaveBoundary()
         held_item = None
+        all_error_waves = 0       # consecutive waves in which EVERY test errored
         n = 0
 
         session.config.pluginmanager.register(self, 'testhide_wave_runner')
@@ -1076,6 +1080,32 @@ class _WaveRunner:
                         print('[testhide]   this session collected NOTHING; check the paths the '
                               'executor was started with')
                     break
+
+                # A poisoned session is FAST, and that is what makes it dangerous.
+                #
+                # pytest caches a fixture's exception and never retries it. Measured on a session
+                # fixture that raises once (a Steam login that failed):
+                #
+                #     wave 0   ['error', 'error']   0.245s   <- the fixture actually ran
+                #     wave 1   ['error', 'error']   0.038s   <- cached; nothing ran at all
+                #
+                # So this executor answers a wave in 38 milliseconds and immediately asks for more.
+                # Against a FIFO queue it out-competes every healthy node and converts the whole
+                # suite into errors on one bad machine — the tests are fine, the report is not, and
+                # the fastest worker on the farm is the broken one.
+                #
+                # Two consecutive all-error waves, not one: a single wave can legitimately be all
+                # errors when a batch happens to land entirely inside one broken class.
+                if results and all(r['outcome'] == 'error' for r in results):
+                    all_error_waves += 1
+                    if all_error_waves >= _MAX_ALL_ERROR_WAVES:
+                        print('[testhide] %d consecutive waves errored on every test; this session '
+                              'is not going to recover (pytest caches a failed fixture and never '
+                              'retries it), ending it so the queue goes to a healthy executor'
+                              % all_error_waves)
+                        break
+                else:
+                    all_error_waves = 0
 
                 if session.shouldfail:
                     print('[testhide] session stopping early: %s' % session.shouldfail)
