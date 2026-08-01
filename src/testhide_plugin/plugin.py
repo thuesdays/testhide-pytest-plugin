@@ -679,6 +679,55 @@ def pytest_addoption(parser):
     )
 
 
+# Everything that can drop a scheduled nodeid, and what each one is.
+#
+# Rewritten after the RA-3 measurement, which found the first version closed three doors to one
+# symptom and left at least four more open — all producing the identical outcome: a nodeid the
+# scheduler assigned, that neither runs, nor reports, nor fails. Measured, batch of 4 explicit
+# nodeids under --testhide-batch:
+#
+#     --deselect <nodeid>   4 passed, 1 deselected, rc=0      (same as -m, different door)
+#     --lf (seeded cache)   1 failed, 3 deselected            (worst: 3 of 4 silently dropped)
+#     --sw                  run 2: 1 failed, 1 deselected
+#     -x / --maxfail=1      failure on test 3 of 20 -> the junit the backend reads contains
+#                           EXACTLY 3 <testcase> elements. The other 17 produce no row at all.
+#
+# Deliberately NOT neutralised, because measurement showed them inert against explicit nodeids:
+# --ignore / --ignore-glob, conftest collect_ignore, testpaths / norecursedirs (all filter
+# DIRECTORY arguments), and --ff / --nf (reorder only, nothing is dropped).
+_BATCH_OVERRIDES = (
+    # attr, neutral value, how to describe it in the log
+    ('markexpr', '', '-m %r'),
+    ('keyword', '', '-k %r'),
+    ('deselect', [], '--deselect %r'),
+    ('lf', False, '--lf (%r)'),
+    ('stepwise', False, '--sw (%r)'),
+    ('stepwise_skip', False, '--sw-skip (%r)'),
+    ('maxfail', 0, '--maxfail/-x (%r)'),
+    # xdist. Guarded by hasattr below: these do not exist when xdist is not installed.
+    ('dist', 'no', '--dist %r'),
+    ('numprocesses', 0, '-n %r'),
+    ('tx', [], '--tx %r'),
+)
+
+_BATCH_REASONS = {
+    'markexpr': 'the scheduler already selected these tests; re-filtering silently drops some',
+    'keyword': 'the scheduler already selected these tests; re-filtering silently drops some',
+    'deselect': 'the scheduler already selected these tests; re-filtering silently drops some',
+    'lf': 'a stale last-failed cache would deselect most of the batch',
+    'stepwise': 'stepwise truncates the batch at the first failure and deselects the rest',
+    'stepwise_skip': 'stepwise truncates the batch at the first failure and deselects the rest',
+    'maxfail': 'stopping early leaves every remaining nodeid with no result at all, and the '
+               'backend cannot tell "failed" from "never ran"',
+    'dist': 'parallel workers re-pay class-scoped fixtures per worker and run several instances of '
+            'a single-instance application',
+    'numprocesses': 'parallel workers re-pay class-scoped fixtures per worker and run several '
+                    'instances of a single-instance application',
+    'tx': 'parallel workers re-pay class-scoped fixtures per worker and run several instances of a '
+          'single-instance application',
+}
+
+
 def _neutralise_batch_argv(config) -> None:
     """Make an explicitly-scheduled batch run exactly the tests it was given.
 
@@ -686,20 +735,16 @@ def _neutralise_batch_argv(config) -> None:
 
     TestHide's distributed strategy hands each executor an explicit list of nodeids, then reuses
     the JOB'S OWN build script to run them — the script is the customer's, so whatever it carries
-    comes along:
+    comes along. A leftover selection flag DESELECTS tests the executor was explicitly told to run.
+    Those tests are not re-queued (the executor reported no result for them, it did not fail them),
+    so they sit in the queue until the heartbeat sweep reclaims them and hands them to another
+    executor — which deselects them too. The suite finishes with tests permanently unaccounted for.
+    See _BATCH_OVERRIDES above for the full list and the measurement behind each entry.
 
-      -m / -k   The scheduler already decided which tests this executor runs. A leftover marker or
-                keyword expression DESELECTS tests it was explicitly told to run. Those tests are
-                not re-queued (the executor reported no result for them, it did not fail them), so
-                they sit in the queue until the heartbeat sweep reclaims them and hands them to
-                another executor — which deselects them too. The suite finishes with tests
-                permanently unaccounted for.
-
-      -n        xdist would fan the batch out across worker processes. Three things break at once:
-                the class-scoped fixture this scheduler exists to amortise is paid once PER WORKER,
-                the app under test is a desktop application that allows a single instance per
-                machine, and the whole farm shares one Steam account. Measured on a 7-test module:
-                guard off -> 4 class-fixture setups, guard on -> 1.
+    On xdist specifically: the class-scoped fixture this scheduler exists to amortise is paid once
+    PER WORKER, the app under test is a desktop application that allows a single instance per
+    machine, and the whole farm shares one Steam account. Measured on a 7-test module: guard off ->
+    4 class-fixture setups, guard on -> 1.
 
     On the two measurements behind the implementation, stated apart because an earlier version of
     this comment ran them together and got the claim wrong:
@@ -709,11 +754,17 @@ def _neutralise_batch_argv(config) -> None:
       * Setting `config.option.dist` HERE does work, because pytest_configure runs after that
         override — measured, 4 workers collapse to 1 setup.
 
-    numprocesses and tx are zeroed as well. That is defence in depth, NOT a measured requirement:
-    with the dist assignment alone the fixture is already paid once. Mutation testing showed both
-    extra assignments are currently redundant; they are kept because they cost nothing and make the
-    intent independent of how a future xdist derives its mode, and this note exists so the next
-    reader does not mistake "redundant today" for "measured necessary".
+    numprocesses and tx are zeroed as well. Measured by mutation, over the suite in
+    tests/test_batch_argv_neutralisation.py, so the next reader does not have to take it on trust:
+
+        drop 'dist', keep numprocesses+tx        -> 47 passed   (survives)
+        keep 'dist', drop numprocesses+tx        -> 47 passed   (survives)
+        drop all three                           -> 8 failed    (killed)
+
+    Either half alone suffices — xdist computes `_is_distribution_mode = dist != "no" and bool(tx)`
+    — so neither is load-bearing GIVEN the other, and the two surviving mutants above are equivalent
+    rather than a hole in the tests. The pair is not decoration either: `--tx popen --tx popen` with
+    no -n reaches distribution mode without setting numprocesses at all.
 
     NOT `-p no:xdist`: that removes the option definitions, so a script that contains -n dies at
     argument parsing with rc=4 before anything runs. Verified against five hostile argv shapes
@@ -721,23 +772,19 @@ def _neutralise_batch_argv(config) -> None:
     """
     opt = config.option
 
-    for attr in ('markexpr', 'keyword'):
-        current = getattr(opt, attr, '') or ''
-        if current:
-            setattr(opt, attr, '')
-            _batch_log(config, "ignoring %s=%r for this batch: the scheduler already selected these "
-                               "tests, and re-filtering them here would silently drop some" % (
-                                   '-m' if attr == 'markexpr' else '-k', current))
-
-    if getattr(opt, 'numprocesses', None):
-        _batch_log(config, "disabling xdist (-n %r) for this batch: parallel workers would re-pay "
-                           "class-scoped fixtures per worker and run several instances of a "
-                           "single-instance application" % (opt.numprocesses,))
-    # Unconditional: -n can arrive through ini addopts or PYTEST_ADDOPTS just as easily as argv, so
-    # there is nothing to condition on that is cheaper than simply assigning.
-    for attr, value in (('dist', 'no'), ('numprocesses', 0), ('tx', [])):
-        if hasattr(opt, attr):
-            setattr(opt, attr, value)
+    for attr, neutral, shape in _BATCH_OVERRIDES:
+        if not hasattr(opt, attr):
+            continue
+        current = getattr(opt, attr)
+        if current == neutral or not current:
+            continue
+        setattr(opt, attr, neutral)
+        # Announced per OVERRIDE, not per flag family. RA-3: the old code logged only when
+        # `numprocesses` was set, so `--dist each --tx popen --tx popen` silently collapsed two
+        # workers into one with no [testhide] line at all — a rewrite of the customer's arguments
+        # that left no trace anywhere.
+        _batch_log(config, "ignoring %s for this batch: %s" % (
+            shape % (current,), _BATCH_REASONS.get(attr, 'it can drop scheduled tests')))
 
 
 def _batch_log(config, message: str) -> None:
@@ -745,15 +792,37 @@ def _batch_log(config, message: str) -> None:
 
     Silently rewriting a customer's own arguments is the kind of help that costs an afternoon when
     it turns out to be wrong, so every override announces itself in the build log.
+
+    print(), not the terminal reporter. The first version preferred getplugin('terminalreporter')
+    and fell back to print — but RA-3 measured that at our tryfirst pytest_configure (and earlier
+    still, at pytest_cmdline_main) the reporter has not been registered yet: TerminalReporter
+    registers in _pytest.terminal.pytest_configure, a plain hookimpl that runs after ours. The
+    branch was unreachable from the only call site, and its docstring described a path that never
+    ran. The line lands above "=== test session starts ===", which the build captures all the same.
     """
-    try:
-        reporter = config.pluginmanager.getplugin('terminalreporter')
-        if reporter is not None:
-            reporter.write_line("[testhide] %s" % message)
-            return
-    except Exception:
-        pass
     print("[testhide] %s" % message)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    """Disarm --looponfail before xdist acts on it.
+
+    The one door that CANNOT be closed from pytest_configure. xdist implements looponfail in
+    `pytest_cmdline_main` (looponfail.py:41-47), which runs BEFORE any pytest_configure and never
+    returns: it enters `while 1` and re-runs failures forever. Measured — `pytest --testhide-batch
+    -f <file>` produced no output at all and had to be killed at 20s. On a farm that is an executor
+    holding its node until the job timeout, reporting nothing for every nodeid it was given.
+
+    Returning None (not a value) lets the rest of the chain run normally; by the time xdist's own
+    impl is called the flag reads False, so it delegates to the ordinary main.
+    """
+    if not getattr(config.option, 'testhide_batch', False):
+        return None
+    if getattr(config.option, 'looponfail', False):
+        config.option.looponfail = False
+        _batch_log(config, "ignoring -f/--looponfail for this batch: it never returns, so the "
+                           "executor would hold its node until the job timeout and report nothing")
+    return None
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -912,10 +981,34 @@ def pytest_collection_modifyitems(config, items):
         else:
             remaining.append(item)
     
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-        items[:] = remaining
+    if not deselected:
+        return
+
+    # RA-3. Under --testhide-batch these nodeids were ASSIGNED to this executor by the scheduler,
+    # and deselecting them produces exactly the outcome the batch guard exists to eliminate: a test
+    # that neither runs, nor reports, nor fails. It is not re-queued (no result was reported, and it
+    # was not failed), so the heartbeat sweep hands it to another executor, which quarantines it
+    # too — forever. Measured before the fix: `--testhide-batch --quarantine-file=q.txt` over 3
+    # explicit nodeids gave "2 passed, 1 deselected" and a junit containing only two of the three.
+    #
+    # Skipping instead of deselecting keeps the quarantine decision (the test does not execute) while
+    # producing a RESULT for it: a <testcase> with <skipped> and the reason, which the scheduler
+    # accounts for and the report shows honestly. Outside a batch nothing changes — an ordinary run
+    # has no scheduler waiting on those nodeids, and deselection keeps the summary clean.
+    if getattr(config.option, 'testhide_batch', False):
+        for item in deselected:
+            item.add_marker(pytest.mark.skip(
+                reason='testhide: quarantined (%s)' % os.path.basename(quarantine_file)))
         print(
-            f'[testhide_quarantine] Deselected {len(deselected)} quarantined tests '
-            f'(from {quarantine_file}), {len(remaining)} remaining'
+            f'[testhide_quarantine] Skipping {len(deselected)} quarantined tests '
+            f'(from {quarantine_file}): reported as skipped rather than dropped, because the '
+            f'TestHide scheduler assigned them to this batch and is waiting for a result'
         )
+        return
+
+    config.hook.pytest_deselected(items=deselected)
+    items[:] = remaining
+    print(
+        f'[testhide_quarantine] Deselected {len(deselected)} quarantined tests '
+        f'(from {quarantine_file}), {len(remaining)} remaining'
+    )

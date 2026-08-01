@@ -8,3 +8,12 @@ src/testhide_plugin/__pycache__/
 # Test bytecode (any pytest/python version)
 __pycache__/
 *.py[cod]
+
+# Local test environment (pytest + xdist, needed by the batch-guard tests)
+.venv/
+
+# Debug artefacts from plugin instrumentation runs — never source
+s.log
+trace.log
+*.marker
+
