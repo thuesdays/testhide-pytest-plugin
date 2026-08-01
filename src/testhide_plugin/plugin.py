@@ -2,6 +2,7 @@
 
 __author__ = 'thuesdays@gmail.com'
 
+import json
 import os
 import signal
 import time
@@ -673,6 +674,15 @@ def pytest_addoption(parser):
     )
 
     group.addoption(
+        '--testhide-session-dir', dest='testhide_session_dir', default=None, action='store',
+        help='Directory carrying the wave protocol of a PERSISTENT session: the scheduler feeds '
+             'this one pytest process batch after batch instead of starting a process per batch, '
+             'so class- and module-scoped fixtures are paid once per executor. Normally delivered '
+             'as TESTHIDE_SESSION_DIR, because a job that starts its tests with its own command '
+             'has nowhere to put an argument.'
+    )
+
+    group.addoption(
         '--testhide-batch', dest='testhide_batch', default=False, action='store_true',
         help='This run executes an explicit set of nodeids chosen by the TestHide scheduler. '
              'Neutralises -m/-k and disables xdist so the given tests actually run, once each.'
@@ -825,12 +835,279 @@ def pytest_cmdline_main(config):
     return None
 
 
+# --------------------------------------------------------------------------- persistent session
+#
+# TestHide's distributed strategy hands an executor one batch at a time. Today each batch is a fresh
+# pytest process, so every class- and module-scoped fixture is re-paid per batch — and on this farm
+# a class fixture is a Steam login and an application start, measured in seconds against test bodies
+# measured in hundredths.
+#
+# A persistent session runs batch after batch as WAVES inside one pytest process. Measured on a
+# 4-class x 5-test suite with a 2s class fixture, 4 nodeids per batch (pytest 9.1.1):
+#
+#     per-batch, 5 processes (today)      18.1s    5 sessions, 5 modules, 8 class setups
+#     waves, one process                   9.3s    1 session,  1 module,  4 class setups
+#     the same 20 nodeids in one go        9.3s    <- the ceiling; a wave costs 0.4% over it
+#
+# so -48.6% against today, and 0.4% off the best any arrangement could do.
+
+_WAVE_POLL_SEC = 0.02
+# How long a live session waits for the next wave before giving up. The executor holds a node for
+# this long doing nothing if the client dies without writing `stop`, so it is deliberately shorter
+# than the build-level timeouts that would otherwise be the only thing to notice.
+_WAVE_IDLE_TIMEOUT_SEC = 600.0
+
+
+class _WaveBoundary:
+    """The sentinel handed to pytest as `nextitem` for the LAST item of a wave.
+
+    SetupState.teardown_exact does:
+
+        needed_collectors = (nextitem and nextitem.listchain()) or []
+
+    and then pops the stack until it matches. So this object's chain decides what survives a wave
+    boundary, and all three plausible answers were measured:
+
+      * None                  pops EVERYTHING, session included. 5 waves -> 5 session setups: the
+                              application restarts once per wave. Zero gain, and it looks like it
+                              works.
+      * [session]             keeps the session, pops module and class. Measured module 5x, class
+                              8x, -4.3% against today. Also looks like it works.
+      * the finished item's   pops NOTHING. The stack stands exactly as the last test left it and is
+        own chain             trimmed at the START of the next wave, when the destination is known
+                              and the pops are the ones a vanilla run would have made anyway.
+
+    Only the third gives fixture parity with vanilla, so the chain is rebound at every boundary
+    rather than built once from the session.
+    """
+
+    __slots__ = ('_chain',)
+
+    def __init__(self):
+        self._chain = []
+
+    def hold(self, item):
+        self._chain = list(item.listchain())
+        return self
+
+    def listchain(self):
+        return self._chain
+
+
+class _WaveRunner:
+    """Runs waves of nodeids inside one session, and reports each wave as it finishes.
+
+    The control channel is a DIRECTORY, named by the TESTHIDE_SESSION_DIR environment variable:
+
+        wave-<n>.json        written by the client:  {"nodeids": [...]}
+        wave-<n>.done.json   written by us:          {"results": [...], "not_collected": [...]}
+        stop                 written by the client:  end the session
+
+    A directory rather than an argument, because the executor may be started by the CUSTOMER'S OWN
+    run_command template, where the client has nowhere to insert a flag; environment variables are
+    already threaded into that path. Files rather than a pipe, because a wave has to survive the
+    client reading stdout on a different schedule than the tests write to it.
+    """
+
+    def __init__(self, control_dir):
+        self.control_dir = control_dir
+        self._wave_reports = {}
+
+    # -- report capture -------------------------------------------------------------------
+    def pytest_runtest_logreport(self, report):
+        """Collect the phase reports of the CURRENT wave.
+
+        The junit report is still assembled once, at session finish, exactly as before. This is a
+        separate, per-wave answer for the scheduler, which cannot wait for the session to end: a
+        nodeid it assigned and never hears about stays `running` until a sweep reclaims it.
+        """
+        rows = self._wave_reports.setdefault(report.nodeid, {})
+        rows[report.when] = report
+
+    def _verdict(self, nodeid):
+        phases = self._wave_reports.get(nodeid) or {}
+        duration = sum(getattr(r, 'duration', 0.0) or 0.0 for r in phases.values())
+        for when in ('setup', 'call', 'teardown'):
+            rep = phases.get(when)
+            if rep is None:
+                continue
+            if rep.failed:
+                # A failure in setup or teardown is an ERROR in pytest's own vocabulary, and the
+                # backend distinguishes them: an error is a broken environment, a failure is a
+                # broken test, and conflating them sends the wrong node to triage.
+                return ('failed' if when == 'call' else 'error'), duration
+            if rep.skipped:
+                # Both phases, not setup alone. A `pytest.skip()` inside the test BODY produces a
+                # skipped CALL report, and reading only the setup phase reported it as passed —
+                # found by the test next to this one. A skip counted as a pass is the one direction
+                # that inflates a green build.
+                return 'skipped', duration
+        return ('passed' if phases else 'missing'), duration
+
+    # -- the loop -------------------------------------------------------------------------
+    def _read_wave(self, n):
+        path = os.path.join(self.control_dir, 'wave-%d.json' % n)
+        stop = os.path.join(self.control_dir, 'stop')
+        deadline = time.time() + _WAVE_IDLE_TIMEOUT_SEC
+        while True:
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding='utf-8') as fh:
+                        payload = json.load(fh)
+                except (ValueError, OSError):
+                    # Written but not yet flushed. Re-read rather than treating a partial file as
+                    # an empty wave, which would report every nodeid in it as not collected.
+                    time.sleep(_WAVE_POLL_SEC)
+                    continue
+                return [str(x) for x in (payload.get('nodeids') or [])]
+            if os.path.exists(stop):
+                return None
+            if time.time() > deadline:
+                print('[testhide] no wave for %.0fs; ending the persistent session'
+                      % _WAVE_IDLE_TIMEOUT_SEC)
+                return None
+            time.sleep(_WAVE_POLL_SEC)
+
+    def _write_done(self, n, results, not_collected):
+        tmp = os.path.join(self.control_dir, 'wave-%d.done.tmp' % n)
+        final = os.path.join(self.control_dir, 'wave-%d.done.json' % n)
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump({'results': results, 'not_collected': not_collected}, fh)
+        # Atomic: the client polls for this file's existence, so it must never observe a half-written
+        # one and conclude the wave produced two results out of twenty.
+        os.replace(tmp, final)
+
+    def _boundary_teardown(self, session, next_first, owner):
+        """Run the held teardown, and make a failure in it visible instead of fatal.
+
+        Measured on a class fixture whose teardown raises, with the boundary falling between two
+        classes:
+
+            vanilla                       rc=1   4 passed, 1 error
+            waves, unguarded boundary     rc=3   2 passed          <- INTERNALERROR
+
+        The exception escapes pytest_runtestloop and kills the session, so the next wave's nodeids
+        never run and never report. Re-attributing it to the item that owned the fixture reproduces
+        vanilla exactly, error row included, and the session survives.
+        """
+        from _pytest.runner import CallInfo
+
+        call = CallInfo.from_call(
+            lambda: session._setupstate.teardown_exact(next_first), when='teardown')
+        if call.excinfo is None:
+            return
+        if owner is None:
+            raise call.excinfo.value
+        report = owner.ihook.pytest_runtest_makereport(item=owner, call=call)
+        owner.ihook.pytest_runtest_logreport(report=report)
+
+    def run(self, session):
+        by_id = {item.nodeid: item for item in session.items}
+        boundary = _WaveBoundary()
+        held_item = None
+        n = 0
+
+        session.config.pluginmanager.register(self, 'testhide_wave_runner')
+        try:
+            while True:
+                wave = self._read_wave(n)
+                if wave is None:
+                    break
+
+                items, not_collected = [], []
+                for nodeid in wave:
+                    item = by_id.get(nodeid)
+                    if item is None:
+                        not_collected.append(nodeid)
+                    else:
+                        items.append(item)
+
+                if items and held_item is not None:
+                    self._boundary_teardown(session, items[0], held_item)
+
+                self._wave_reports = {}
+                for i, item in enumerate(items):
+                    nextitem = items[i + 1] if i + 1 < len(items) else boundary.hold(item)
+                    item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+                    held_item = item
+                    if session.shouldfail or session.shouldstop:
+                        break
+
+                results = []
+                for item in items:
+                    outcome, duration = self._verdict(item.nodeid)
+                    results.append({'nodeid': item.nodeid, 'outcome': outcome,
+                                    'duration': round(duration, 6)})
+                self._write_done(n, results, not_collected)
+
+                if not_collected:
+                    # Loud, because the alternative is a nodeid that was assigned and simply never
+                    # spoken of again. The usual cause is an executor started with a narrower scope
+                    # than the batches it is being given.
+                    print('[testhide] wave %d: %d nodeid(s) not collected in this session: %s'
+                          % (n, len(not_collected), ', '.join(not_collected[:5])))
+
+                if session.shouldfail:
+                    print('[testhide] session stopping early: %s' % session.shouldfail)
+                    break
+                if session.shouldstop:
+                    print('[testhide] session interrupted: %s' % session.shouldstop)
+                    break
+                n += 1
+        finally:
+            session.config.pluginmanager.unregister(self)
+            # The one place the session itself unwinds. Guarded: a teardown that raises here must
+            # not turn a completed run into an INTERNALERROR.
+            try:
+                session._setupstate.teardown_exact(None)
+            except Exception as exc:
+                print('[testhide] error during final teardown: %r' % (exc,))
+
+
+def _session_control_dir(config):
+    """Where the wave protocol lives, or None for an ordinary run.
+
+    The environment variable is the primary source and the option exists for the client-composed
+    command line and for tests. A path, not a switch: the same reason --report-xml is a path.
+    """
+    return (getattr(config.option, 'testhide_session_dir', None)
+            or os.environ.get('TESTHIDE_SESSION_DIR') or None)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtestloop(session):
+    """Run the session as WAVES when a control directory is present; otherwise stand aside.
+
+    tryfirst because pytest_runtestloop is firstresult=True: the first implementation to return a
+    value ends the call. Returning None (an ordinary run) lets pytest's own loop proceed untouched.
+    """
+    control_dir = _session_control_dir(session.config)
+    if not control_dir:
+        return None
+
+    if session.testsfailed and not session.config.option.continue_on_collection_errors:
+        raise session.Failed('%d error(s) during collection' % session.testsfailed)
+    if session.config.option.collectonly:
+        return True
+
+    _WaveRunner(control_dir).run(session)
+    return True
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     try:
         config.pluginmanager.add_hookspecs(hookspecs)
     except pluggy.PluginValidationError:
         pass
+
+    # A persistent session IS a scheduled batch — several of them — so it inherits the batch guard
+    # rather than restating it. That is not tidiness: -x is fatal here in a way it is not per-batch.
+    # Measured, two waves of two nodeids with a failure in the first:
+    #     guard applied   2/2 waves ran, all 4 nodeids reported
+    #     -x left in      0/2 waves completed; the session died and wave 1 was never even delivered
+    if _session_control_dir(config):
+        config.option.testhide_batch = True
 
     # Before the --report-xml gate below: a batch must be neutralised whether or not this run also
     # produces a report.
