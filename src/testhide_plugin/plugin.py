@@ -1059,6 +1059,22 @@ class _WaveRunner:
                     # correctly — the healthy nodeids in this very wave just reported.
                     print('[testhide] wave %d had no collectable tests at all; this session cannot '
                           'serve the queue it is being given, ending it' % n)
+                    print('[testhide]   rootdir: %s' % session.config.rootdir)
+                    if by_id:
+                        print('[testhide]   this session collected ids like: %s'
+                              % next(iter(by_id)))
+                        print('[testhide]   the wave asked for:              %s' % wave[0])
+                        print('[testhide]   nodeids are relative to rootdir, so a rootdir that '
+                              'differs from the one discovery ran under renames every test. '
+                              'Passing --testhide-session-dir as TWO tokens with a path outside '
+                              'the tests directory does exactly that: pytest resolves rootdir '
+                              'before it knows the option, counts the value as a path argument, '
+                              'and moves rootdir up to the common ancestor. Deliver the directory '
+                              'as TESTHIDE_SESSION_DIR (immune), or write --testhide-session-dir='
+                              'PATH as one token (also immune). Measured on pytest 9.1.1.')
+                    else:
+                        print('[testhide]   this session collected NOTHING; check the paths the '
+                              'executor was started with')
                     break
 
                 if session.shouldfail:

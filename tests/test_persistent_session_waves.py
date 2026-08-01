@@ -532,3 +532,40 @@ def test_the_wave_loop_marks_the_session_itself(pytester):
     assert reporter._runtestloop_entered is True, (
         "the wave loop left the session marked as one that never ran tests — "
         "pytest_sessionfinish would discard the report")
+
+
+def test_the_nothing_collectable_message_names_the_rootdir_cause(pytester):
+    """The most likely cause of this symptom is not a mistyped nodeid — it is a rootdir mismatch,
+    and it is invisible unless the message says so.
+
+    Measured on pytest 9.1.1, same suite, same working directory:
+
+        (no flag)                                        test_suite.py::test_1
+        --testhide-session-dir inside_the_suite          test_suite.py::test_1
+        --testhide-session-dir ../outside   TWO TOKENS   suite/test_suite.py::test_1   <-- renamed
+        --testhide-session-dir=../outside   ONE TOKEN    test_suite.py::test_1
+        TESTHIDE_SESSION_DIR=../outside                  test_suite.py::test_1
+
+    pytest resolves rootdir BEFORE it knows a plugin's options, so a value passed as its own token
+    is counted as a path argument and rootdir moves up to the common ancestor of the tests and that
+    path. Nodeids are relative to rootdir, so every one of them is renamed and every wave is
+    entirely uncollectable — with a temp directory for a control channel, which is exactly what the
+    client would pass, that is the whole feature dead. The environment variable and the `=` form are
+    both immune; the env var is the production channel for other reasons already.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [["wrong/prefix/test_suite.py::TestA::test_1"]], deadline=3.0)
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    result.stdout.fnmatch_lines([
+        "*no collectable tests at all*",
+        "*rootdir:*",
+        "*this session collected ids like:*",
+        "*the wave asked for:*",
+        "*nodeids are relative to rootdir*",
+    ])
