@@ -562,6 +562,22 @@ class TesthidePlugin:
         Finalizes the report. Only the master node will merge all temporary files.
         The entire merge and write process is protected by a file lock.
         """
+        # D-0801: a collect-only run must never touch the report.
+        #
+        # pytest_sessionfinish fires for --collect-only exactly as it does for a real run, but no
+        # test executed, so temp_dir is empty. The merge below then os.replace()s the existing
+        # junittests.xml with a document containing tests="0" — destroying the last real report.
+        #
+        # Measured: RUN 1 (normal) wrote 8 cases; RUN 2 (--collect-only, SAME --report-xml path)
+        # left tests="0". This bites today for anyone who runs --collect-only with --report-xml,
+        # and it is load-bearing for the upcoming TPS discovery pass, which reuses the job's own
+        # build script — and therefore its --report-xml argument — verbatim.
+        #
+        # Guarded here rather than by clearing report_xml earlier, because that alternative is
+        # sensitive to plugin registration order and was observed to fail when the order reversed.
+        if getattr(session.config.option, "collectonly", False):
+            return
+
         if self.is_xdist_master:
             self._merge_temp_dir_into_final()
     
