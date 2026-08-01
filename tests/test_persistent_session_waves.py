@@ -342,3 +342,55 @@ def test_stop_with_no_waves_ends_the_session_cleanly(pytester):
 
     result.assert_outcomes()
     assert _paid(pytester, "session") == 0, "a session with no waves paid for the application"
+
+
+# --------------------------------------------------------------- one broken file, one executor
+
+def test_a_broken_module_does_not_take_the_whole_executor_down(pytester):
+    """A collection error ends a one-shot run. It must NOT end a persistent one.
+
+    An executor holds assignments: aborting at collection means every nodeid this node was given,
+    in this wave and every wave after it, comes back with no result — not run, not failed, not
+    re-queued. The sweep then hands them to another executor, which imports the same broken module
+    and dies the same way. One un-importable file takes the fleet down a node at a time, silently.
+
+    Serving the waves anyway means the healthy tests run and report, and the ones inside the broken
+    file come back named in `not_collected`.
+    """
+    pytester.makepyfile(test_broken="import totally_missing_module_xyz\n\ndef test_x(): pass\n")
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [A[:2], ["test_broken.py::test_x"] + A[2:]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "test_broken.py", "--testhide-session-dir", str(control),
+        "--continue-on-collection-errors", timeout=120)
+    feeder.join(timeout=30)
+
+    # Both waves ran and reported, and the healthy nodeids have verdicts.
+    done0 = json.loads((control / "wave-0.done.json").read_text(encoding="utf-8"))
+    done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
+    assert [r["nodeid"] for r in done0["results"]] == A[:2]
+    assert [r["nodeid"] for r in done1["results"]] == A[2:]
+    assert done1["not_collected"] == ["test_broken.py::test_x"]
+    assert _paid(pytester, "class-A") == 1, "the split class still paid its fixture once"
+
+
+def test_a_broken_module_serves_waves_even_without_continue_on_collection_errors(pytester):
+    """The flag above is the customer's choice, and the farm's scripts do not carry it. Without it,
+    pytest's own loop aborts the session — which is exactly the behaviour a persistent session must
+    not inherit."""
+    pytester.makepyfile(test_broken="import totally_missing_module_xyz\n")
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [A[:2], A[2:]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "test_broken.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    assert (control / "wave-0.done.json").exists(), "the executor died at collection"
+    assert (control / "wave-1.done.json").exists()
+    result.stdout.fnmatch_lines(["*collection error*serving waves anyway*"])

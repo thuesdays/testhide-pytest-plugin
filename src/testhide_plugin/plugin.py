@@ -1085,10 +1085,26 @@ def pytest_runtestloop(session):
     if not control_dir:
         return None
 
-    if session.testsfailed and not session.config.option.continue_on_collection_errors:
-        raise session.Failed('%d error(s) during collection' % session.testsfailed)
     if session.config.option.collectonly:
         return True
+
+    if session.testsfailed:
+        # A collection error does NOT end a persistent session, which is the opposite of what a
+        # one-shot run does — and deliberately.
+        #
+        # An executor holds assignments. Aborting here means every nodeid the scheduler gave this
+        # node, in this wave and every wave after it, comes back with no result at all: not run, not
+        # failed, not re-queued, until a sweep reclaims them and hands them to another executor that
+        # imports the same broken module and dies the same way. One un-importable file would take
+        # the whole fleet down, one node at a time, reporting nothing.
+        #
+        # Serving the waves instead means the healthy nodeids in them run and report, and the ones
+        # inside the broken module come back as `not_collected` — named, in the wave's own result
+        # file, which is the difference between a diagnosable build and a silent one. pytest has
+        # already emitted the collection error itself, so the cause is in the log either way.
+        print('[testhide] %d collection error(s); serving waves anyway so assigned tests still '
+              'report. Tests in the affected files will come back as not collected.'
+              % session.testsfailed)
 
     _WaveRunner(control_dir).run(session)
     return True
