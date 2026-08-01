@@ -672,6 +672,89 @@ def pytest_addoption(parser):
              'Can also be set via TESTHIDE_QUARANTINE_FILE env var.'
     )
 
+    group.addoption(
+        '--testhide-batch', dest='testhide_batch', default=False, action='store_true',
+        help='This run executes an explicit set of nodeids chosen by the TestHide scheduler. '
+             'Neutralises -m/-k and disables xdist so the given tests actually run, once each.'
+    )
+
+
+def _neutralise_batch_argv(config) -> None:
+    """Make an explicitly-scheduled batch run exactly the tests it was given.
+
+    Only fires under --testhide-batch, so an ordinary run is untouched.
+
+    TestHide's distributed strategy hands each executor an explicit list of nodeids, then reuses
+    the JOB'S OWN build script to run them — the script is the customer's, so whatever it carries
+    comes along:
+
+      -m / -k   The scheduler already decided which tests this executor runs. A leftover marker or
+                keyword expression DESELECTS tests it was explicitly told to run. Those tests are
+                not re-queued (the executor reported no result for them, it did not fail them), so
+                they sit in the queue until the heartbeat sweep reclaims them and hands them to
+                another executor — which deselects them too. The suite finishes with tests
+                permanently unaccounted for.
+
+      -n        xdist would fan the batch out across worker processes. Three things break at once:
+                the class-scoped fixture this scheduler exists to amortise is paid once PER WORKER,
+                the app under test is a desktop application that allows a single instance per
+                machine, and the whole farm shares one Steam account. Measured on a 7-test module:
+                guard off -> 4 class-fixture setups, guard on -> 1.
+
+    On the two measurements behind the implementation, stated apart because an earlier version of
+    this comment ran them together and got the claim wrong:
+
+      * Putting `--dist no` IN THE SCRIPT does not work. xdist's own plugin overrides --dist when
+        -n is present, so `-n 4 --dist no` still forks 4 workers — measured, 4 class-fixture setups.
+      * Setting `config.option.dist` HERE does work, because pytest_configure runs after that
+        override — measured, 4 workers collapse to 1 setup.
+
+    numprocesses and tx are zeroed as well. That is defence in depth, NOT a measured requirement:
+    with the dist assignment alone the fixture is already paid once. Mutation testing showed both
+    extra assignments are currently redundant; they are kept because they cost nothing and make the
+    intent independent of how a future xdist derives its mode, and this note exists so the next
+    reader does not mistake "redundant today" for "measured necessary".
+
+    NOT `-p no:xdist`: that removes the option definitions, so a script that contains -n dies at
+    argument parsing with rc=4 before anything runs. Verified against five hostile argv shapes
+    (-n 4, -n auto, --dist loadscope, --dist worksteal, an explicit -p xdist).
+    """
+    opt = config.option
+
+    for attr in ('markexpr', 'keyword'):
+        current = getattr(opt, attr, '') or ''
+        if current:
+            setattr(opt, attr, '')
+            _batch_log(config, "ignoring %s=%r for this batch: the scheduler already selected these "
+                               "tests, and re-filtering them here would silently drop some" % (
+                                   '-m' if attr == 'markexpr' else '-k', current))
+
+    if getattr(opt, 'numprocesses', None):
+        _batch_log(config, "disabling xdist (-n %r) for this batch: parallel workers would re-pay "
+                           "class-scoped fixtures per worker and run several instances of a "
+                           "single-instance application" % (opt.numprocesses,))
+    # Unconditional: -n can arrive through ini addopts or PYTEST_ADDOPTS just as easily as argv, so
+    # there is nothing to condition on that is cheaper than simply assigning.
+    for attr, value in (('dist', 'no'), ('numprocesses', 0), ('tx', [])):
+        if hasattr(opt, attr):
+            setattr(opt, attr, value)
+
+
+def _batch_log(config, message: str) -> None:
+    """Say what was overridden, on the terminal the build captures.
+
+    Silently rewriting a customer's own arguments is the kind of help that costs an afternoon when
+    it turns out to be wrong, so every override announces itself in the build log.
+    """
+    try:
+        reporter = config.pluginmanager.getplugin('terminalreporter')
+        if reporter is not None:
+            reporter.write_line("[testhide] %s" % message)
+            return
+    except Exception:
+        pass
+    print("[testhide] %s" % message)
+
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
@@ -679,7 +762,12 @@ def pytest_configure(config):
         config.pluginmanager.add_hookspecs(hookspecs)
     except pluggy.PluginValidationError:
         pass
-    
+
+    # Before the --report-xml gate below: a batch must be neutralised whether or not this run also
+    # produces a report.
+    if getattr(config.option, 'testhide_batch', False):
+        _neutralise_batch_argv(config)
+
     if not config.option.report_xml:
         return
     
