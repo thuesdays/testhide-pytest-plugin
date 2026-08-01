@@ -140,9 +140,15 @@ def test_a_class_split_across_consecutive_waves_pays_its_fixture_once(pytester):
 def test_fixture_payments_match_a_vanilla_run_of_the_same_nodeids(pytester):
     """Parity, not merely "fewer". A wave loop that skipped a fixture would also score well on the
     test above."""
-    result, _ = run_waves(pytester, [A[:2], A[2:], B])
+    result, done = run_waves(pytester, [A[:2], A[2:], B])
     waves = {name: _paid(pytester, name) for name in ("session", "module", "class-A", "class-B")}
     result.assert_outcomes(passed=5)
+    # Not incidental. Both sides of the comparison below equal {session:1, module:1, class-A:1,
+    # class-B:1} for ANY arrangement that runs these five nodeids without a teardown in between --
+    # including pytest's own loop with the wave engine switched off entirely. Measured: forcing the
+    # engine off left this test green and only its neighbour red, and the single line that killed
+    # that mutant was this one, which this test used to throw away.
+    assert all(d is not None for d in done), "a wave never reported"
 
     for f in pytester.path.glob("paid-*.marker"):
         f.unlink()
@@ -527,6 +533,10 @@ def test_the_junit_report_carries_every_wave(pytester):
     feeder.join(timeout=30)
 
     result.assert_outcomes(passed=5)
+    # First: that these five tests ran as WAVES at all. Every assertion below is equally true of an
+    # ordinary run of the same file with --report-xml -- verified: 5 passed, report written, five
+    # cases -- so without this line the test is named after a path it never visits.
+    assert (control / "wave-1.done.json").exists(), "the waves never ran"
     report = pytester.path / "junittests.xml"
     assert report.exists(), "the report was discarded"
 
