@@ -1076,3 +1076,131 @@ def test_a_slow_test_reports_a_larger_duration_than_a_fast_one(pytester):
     fast = by_id["test_suite.py::test_fast"]
     assert slow > 0.2, "the slow test reported %r" % slow
     assert slow > fast * 10, "slow=%r fast=%r" % (slow, fast)
+
+
+# ---------------------------------------------------------------- the session outlives the agent
+
+def _ctl(pytester):
+    control = pytester.path / "control"
+    control.mkdir()
+    return control
+
+
+def test_the_session_publishes_its_own_pid_before_it_collects(pytester):
+    """The handshake, and the only handle that reaches the interpreter.
+
+    The client starts cmd.exe, which starts python; every kill it can perform walks down from the
+    shell. Once the shell has exited -- or was never assigned to the job object, which the
+    interactive launch path can skip -- this file is the only way to reach the process that is
+    holding the application under test.
+
+    At CONFIGURE time, not in the wave loop: on a large suite, collection is the longest part of a
+    session's startup, and the client needs to know "it started" during exactly that window.
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = _ctl(pytester)
+    (control / "stop").write_text("", encoding="utf-8")
+
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=40)
+
+    assert result.ret == 0
+    published = json.loads((control / "session-pid.json").read_text(encoding="utf-8"))
+    assert isinstance(published["pid"], int) and published["pid"] > 0
+    assert published["plugin_version"] and published["protocol"] == 1
+
+
+def test_an_orphaned_session_exits_without_reporting_anything(pytester, monkeypatch):
+    """The guarantee that survives the agent dying.
+
+    A persistent session outlives every batch, so for the first time the agent's own `finally` is
+    not enough: kill the agent and nothing runs at all. The only code that still executes is this
+    process, so the guarantee has to live here.
+
+    And it must be a HARD exit. A `break` would fall into the results loop, which emits a verdict
+    for every item of the wave -- an item that never ran has no phase reports, so _verdict returns
+    'missing', WaveJUnit renders <error>, and the backend reads <error> as FAILED. One stalled
+    heartbeat would publish every remaining test of the wave as a failure, and those verdicts are
+    final: a later truthful row for the same nodeid is dropped as a duplicate. So the assertion
+    that matters is the NEGATIVE one -- nothing was written.
+    """
+    from testhide_plugin import plugin as tp
+
+    pytester.makepyfile(test_suite=SUITE)
+    control = _ctl(pytester)
+    # A pid that cannot exist, and a heartbeat old enough to be stale by any reading.
+    monkeypatch.setenv("TESTHIDE_SESSION_OWNER_PID", "999999999")
+    hb = control / "owner-alive"
+    hb.write_text("", encoding="utf-8")
+    os.utime(str(hb), (time.time() - 10_000, time.time() - 10_000))
+
+    feeder = _feed(control, [A[:2]], deadline=3.0)
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=60)
+    feeder.join(timeout=30)
+
+    assert result.ret == 3, "expected the hard-exit code, got %r" % result.ret
+    assert not (control / "wave-0.done.json").exists(), (
+        "an orphaned session published verdicts; unrun tests would be reported as failures")
+    assert not (control / "session-ended.json").exists()
+
+
+def test_a_live_owner_is_never_mistaken_for_a_dead_one(pytester, monkeypatch):
+    """The load-bearing negative. A false DEATH abandons a running wave and hands its nodeids to
+    another node; a false ALIVE only costs a timeout. The check must therefore be hard to trigger:
+    a fresh heartbeat alone keeps the session, whatever the pid says."""
+    pytester.makepyfile(test_suite=SUITE)
+    control = _ctl(pytester)
+    monkeypatch.setenv("TESTHIDE_SESSION_OWNER_PID", "999999999")
+    (control / "owner-alive").write_text("", encoding="utf-8")     # written just now
+
+    result, done = None, None
+    feeder = _feed(control, [A[:2], A[2:]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=60)
+    feeder.join(timeout=30)
+
+    result.assert_outcomes(passed=3)
+    assert (control / "wave-1.done.json").exists()
+
+
+def test_a_missing_heartbeat_file_is_not_evidence_of_death(pytester, monkeypatch):
+    """An older client writes no heartbeat at all. Absence must read as "unknown", not "gone" --
+    otherwise upgrading the plugin alone would kill every session on the farm."""
+    pytester.makepyfile(test_suite=SUITE)
+    control = _ctl(pytester)
+    monkeypatch.setenv("TESTHIDE_SESSION_OWNER_PID", "999999999")
+
+    feeder = _feed(control, [A[:2]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=60)
+    feeder.join(timeout=30)
+
+    result.assert_outcomes(passed=2)
+    assert (control / "wave-0.done.json").exists()
+
+
+def test_the_owner_check_is_the_first_statement_of_the_item_loop_body():
+    """Placement, asserted over the AST because it cannot be observed from outside.
+
+    The item loop ends with a `break` on shouldfail/shouldstop, so a check placed after the
+    protocol call is skipped by every early exit -- the same trailing-await shape that has bitten
+    this codebase before. First statement is the only placement nothing can skip.
+    """
+    import ast
+    import inspect
+    from testhide_plugin import plugin as tp
+
+    tree = ast.parse(inspect.getsource(tp))
+    run = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == 'run')
+    loop = next(n for n in ast.walk(run)
+                if isinstance(n, ast.For)
+                and isinstance(n.iter, ast.Call)
+                and getattr(n.iter.func, 'id', '') == 'enumerate')
+
+    first = loop.body[0]
+    assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+    assert getattr(first.value.func, 'attr', None) == '_abandon_if_orphaned', (
+        "the owner check is not the first statement of the item loop; the break at the foot of the "
+        "loop would skip it")

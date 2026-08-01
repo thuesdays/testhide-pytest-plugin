@@ -5,6 +5,7 @@ __author__ = 'thuesdays@gmail.com'
 import json
 import os
 import signal
+import sys
 import time
 import socket
 import shutil
@@ -860,6 +861,11 @@ def pytest_cmdline_main(config):
 #
 # so -48.6% against today, and 0.4% off the best any arrangement could do.
 
+# The protocol version the client handshakes on. Bumped whenever the control-directory contract
+# changes; the client reads it out of session-pid.json and refuses to speak a version it does not
+# know rather than guessing.
+__version__ = '0.3.1'
+
 _WAVE_POLL_SEC = 0.02
 # How long a live session waits for the next wave before giving up. The executor holds a node for
 # this long doing nothing if the client dies without writing `stop`, so it is deliberately shorter
@@ -879,6 +885,54 @@ _MIN_ALL_ERROR_WAVES = 2
 # the session cannot serve the queue it is being given. See the rule at the call site for why a
 # missing file is the discriminator and a missing test is not.
 _MAX_UNKNOWN_FILE_WAVES = 2
+
+# How stale the owner's liveness file may get before this session concludes its owner is gone. Six
+# writes at the client's 30 s cadence, so five may be lost to a busy agent or a slow shared temp,
+# and comfortably under _WAVE_IDLE_TIMEOUT_SEC so an orphan is always noticed by THIS rule first --
+# the idle rule would let the process linger for the full ten minutes holding the application.
+_OWNER_STALE_SEC = 180.0
+
+
+def _owner_is_gone(control_dir, owner_pid):
+    """Whether the agent that started this session has died.
+
+    A persistent session outlives every batch, so for the first time the agent's own `finally` is
+    not a sufficient guarantee: kill the agent and nothing at all runs. The only thing that still
+    executes is this process, so the guarantee has to live here.
+
+    Two independent signals, because either alone has a hole: a PID can be recycled, and a liveness
+    file can go stale on a machine that merely paused. Both must say gone.
+
+    On Windows the PID check is OpenProcess + WaitForSingleObject and NOT os.kill(pid, 0) --
+    os.kill on Windows is TerminateProcess, so the "harmless probe" spelling would kill the agent.
+    """
+    heartbeat = os.path.join(control_dir, 'owner-alive')
+    try:
+        age = time.time() - os.path.getmtime(heartbeat)
+    except OSError:
+        # No heartbeat file at all: an older client, or one that never wrote the first beat. Absence
+        # is not evidence of death -- fall back to the PID alone.
+        age = 0.0
+    if age <= _OWNER_STALE_SEC:
+        return False
+
+    if not owner_pid:
+        return True
+    try:
+        if os.name == 'nt':
+            import ctypes
+            SYNCHRONIZE, WAIT_OBJECT_0 = 0x00100000, 0
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(owner_pid))
+            if not handle:
+                return True                       # cannot even open it: gone
+            try:
+                return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        os.kill(int(owner_pid), 0)                # POSIX: signal 0 really is a probe
+        return False
+    except (OSError, ValueError, AttributeError):
+        return True
 
 
 class _Chain:
@@ -976,10 +1030,31 @@ class _WaveRunner:
     that reads both learns every verdict the session produced.
     """
 
-    def __init__(self, control_dir):
+    def __init__(self, control_dir, owner_pid=None):
         self.control_dir = control_dir
+        self.owner_pid = owner_pid
         self._wave_reports = {}
         self._published = {}
+
+    def _abandon_if_orphaned(self):
+        """End the process HARD if the agent that owns this session is gone.
+
+        os._exit, not break, and the distinction is the whole point. A break falls into the results
+        loop, which emits a verdict for every item of the wave -- and an item that never ran has no
+        phase reports, so _verdict returns 'missing', WaveJUnit renders it as <error>, and the
+        backend reads <error> as FAILED. One stalled heartbeat (a paused VM, a snapshot, a saturated
+        shared temp) would publish every remaining test of the wave as a failure, and those verdicts
+        are final: a later, truthful row for the same nodeid is dropped as a duplicate.
+
+        Exiting writes nothing at all. The client sees a process that is gone, sends nothing, and
+        the batch is re-run -- which is the only outcome that cannot invent a result.
+        """
+        if not _owner_is_gone(self.control_dir, self.owner_pid):
+            return
+        print('[testhide] the agent that started this session (pid %s) is gone; exiting without '
+              'reporting, so its tests are re-run rather than invented' % (self.owner_pid,))
+        sys.stdout.flush()
+        os._exit(3)
 
     # -- report capture -------------------------------------------------------------------
     def pytest_runtest_logreport(self, report):
@@ -1045,6 +1120,7 @@ class _WaveRunner:
                     return list(dict.fromkeys(str(x) for x in nodeids))
             if os.path.exists(stop):
                 return None
+            self._abandon_if_orphaned()
             if time.time() > deadline:
                 print('[testhide] no wave for %.0fs; ending the persistent session'
                       % _WAVE_IDLE_TIMEOUT_SEC)
@@ -1137,6 +1213,10 @@ class _WaveRunner:
                 self._wave_reports = {}
                 self._published = {}
                 for i, item in enumerate(items):
+                    # First statement of the body, and that placement is load-bearing: the `break`
+                    # at the foot of this loop skips anything trailing, so a check placed after the
+                    # protocol call would be bypassed by every early exit.
+                    self._abandon_if_orphaned()
                     nextitem = items[i + 1] if i + 1 < len(items) else boundary.hold(item)
                     item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
                     held_item = item
@@ -1305,6 +1385,33 @@ class _WaveRunner:
             print('[testhide] could not write the session end marker: %r' % (exc,))
 
 
+def _announce_session(control_dir):
+    """Publish this process's identity, at CONFIGURE time.
+
+    Two jobs, and both need it this early -- before collection, which on a large suite is the
+    longest part of a session's startup:
+
+      * A HANDSHAKE. The client cannot otherwise distinguish "the plugin is installed and starting"
+        from "an older plugin ignored the session directory and is running the whole tests_path".
+        The second is what a farm with one application instance per machine must never do.
+      * The ENGINE pid. The client starts `cmd.exe`, which starts python; every kill it can perform
+        walks from the shell down. Once the shell has exited -- or was never assigned to the job
+        object, which the interactive launch path can skip -- this file is the only way to reach the
+        interpreter that is holding the application.
+
+    Best-effort by construction: a session that cannot write it still runs. The client treats its
+    absence as "no session support" and falls back, which is the safe direction.
+    """
+    payload = {'pid': os.getpid(), 'plugin_version': __version__, 'protocol': 1}
+    tmp = os.path.join(control_dir, 'session-pid.json.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, os.path.join(control_dir, 'session-pid.json'))
+    except OSError as exc:
+        print('[testhide] could not publish the session pid: %r' % (exc,))
+
+
 def _session_control_dir(config):
     """Where the wave protocol lives, or None for an ordinary run.
 
@@ -1358,7 +1465,7 @@ def pytest_runtestloop(session):
     if reporter is not None:
         reporter._runtestloop_entered = True
 
-    _WaveRunner(control_dir).run(session)
+    _WaveRunner(control_dir, os.environ.get('TESTHIDE_SESSION_OWNER_PID')).run(session)
     return True
 
 
@@ -1374,10 +1481,12 @@ def pytest_configure(config):
     # Measured, two waves of two nodeids with a failure in the first:
     #     guard applied   2/2 waves ran, all 4 nodeids reported
     #     -x left in      0/2 waves completed; the session died and wave 1 was never even delivered
-    if _session_control_dir(config):
+    control_dir = _session_control_dir(config)
+    if control_dir:
         config.option.testhide_batch = True
         # Before collection, which is the only time this can be observed.
         config.pluginmanager.register(_BrokenCollectors(), 'testhide_broken_collectors')
+        _announce_session(control_dir)
 
     # Before the --report-xml gate below: a batch must be neutralised whether or not this run also
     # produces a report.
