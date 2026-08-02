@@ -1612,6 +1612,52 @@ def _resolve_quarantine_path(config):
     return None
 
 
+DISCOVERY_CATALOGUE_ENV = 'TESTHIDE_DISCOVERY_CATALOGUE'
+CATALOGUE_VERSION = 1
+
+
+def pytest_collection_finish(session):
+    """Write what collection knows about each test, when the agent asks for it.
+
+    A `--collect-only -q` run prints one bare nodeid per line, and that is all the scheduler has
+    ever received. It is enough to SPLIT a suite and not enough to PLACE it: "this test needs a
+    Windows 10 box" or "this one drives Steam" is expressed as a pytest MARKER, and a marker does
+    not survive the round trip -- not in the output, not in the payload, not in storage.
+
+    So the catalogue carries markers as PLACEMENT metadata. Not as a selection axis: the scheduler
+    still hands out nodeids, `-m` is still neutralised in a batch, and nothing here re-implements
+    `-m folder_X`. It answers one question the queue cannot otherwise answer -- which machine a
+    given test is allowed to run on.
+
+    Gated on an ENVIRONMENT VARIABLE rather than a flag, deliberately. An unknown flag makes an
+    older plugin exit 4 before collecting anything, and discovery is not optional -- a farm
+    mid-upgrade would lose the whole run. An unknown variable is ignored, and the agent then falls
+    back to the stdout parse it has always used, with no markers and a line saying so.
+    """
+    path = os.environ.get(DISCOVERY_CATALOGUE_ENV)
+    if not path:
+        return
+
+    try:
+        rows = []
+        for item in getattr(session, 'items', None) or []:
+            try:
+                marks = sorted({m.name for m in item.iter_markers() if getattr(m, 'name', None)})
+            except Exception:
+                marks = []
+            rows.append({'nodeid': item.nodeid, 'markers': marks})
+
+        payload = json.dumps({'version': CATALOGUE_VERSION, 'tests': rows})
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except Exception as exc:
+        # Never fail collection over metadata. Without the file the agent uses the stdout parse,
+        # which is exactly the behaviour of every plugin version before this one.
+        print('[testhide] could not write the discovery catalogue: %r' % (exc,))
+
+
 def pytest_collection_modifyitems(config, items):
     """
     Quarantine hook: deselects quarantined tests before execution.
