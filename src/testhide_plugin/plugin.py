@@ -1225,8 +1225,19 @@ class _WaveRunner:
                     if row is not None:
                         amended.append(row)
 
-                self._wave_reports = {}
-                self._published = {}
+                if items:
+                    # Cleared only once the boundary ABOVE has actually consumed it. That boundary
+                    # is gated on `items`, so a wave in which nothing is collectable never crosses
+                    # it — while `held_item` is still held, still owning a class/module/session
+                    # teardown that has not run. Wiping here regardless dropped that item's phase
+                    # reports AND its published outcome, so the next non-empty wave amended it from
+                    # a _verdict over no phases at all: `missing`, for a test that had already
+                    # reported `passed`. The client renders `missing` as <error> and the backend
+                    # reads <error> as failed, which is the one direction this whole channel exists
+                    # to prevent. One renamed nodeid is enough to produce an empty wave, and the
+                    # wave is one test by default.
+                    self._wave_reports = {}
+                    self._published = {}
                 for i, item in enumerate(items):
                     # First statement of the body, and that placement is load-bearing: the `break`
                     # at the foot of this loop skips anything trailing, so a check placed after the

@@ -887,6 +887,91 @@ def test_the_session_end_marker_is_written_even_when_nothing_failed(pytester):
     assert all(d is not None for d in done)
 
 
+def test_a_wave_with_nothing_collectable_does_not_amend_the_previous_wave_to_missing(pytester):
+    """The amendment channel must only ever carry a verdict that CHANGED.
+
+    A wave whose every nodeid is uncollectable — one renamed test, at the default batch of one — is
+    served and reported empty, and correctly does not settle the held item's deferred teardown,
+    because there is no next item to settle it against. The item stays held. Wiping the wave
+    baseline anyway threw away the phase reports and the published outcome of a test that had
+    already reported `passed`, so the next real wave amended it to `missing` — which the client
+    writes as <error> and the backend reads as failed.
+
+    Measured on the shipped plugin with waves [test_1], [renamed], [test_2]: wave 2 carried
+    {'nodeid': '...::test_1', 'outcome': 'missing'} while pytest itself said "2 passed".
+    """
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [[A[0]], ["test_suite.py::TestA::test_renamed"], [A[1]]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done = [json.loads((control / ("wave-%d.done.json" % n)).read_text(encoding="utf-8"))
+            for n in range(3)]
+
+    assert done[1]["not_collected"] == ["test_suite.py::TestA::test_renamed"], (
+        "the wave under test was not the empty one this test needs: %r" % done[1])
+    assert done[2]["amended"] == [], (
+        "a wave that collected nothing wiped the baseline and the previous wave's test was "
+        "re-published: %r" % done[2]["amended"])
+    assert _rows(done[0], "results") == {A[0]: "passed"}
+    assert _rows(done[2], "results") == {A[1]: "passed"}
+    result.assert_outcomes(passed=2)
+
+
+def test_a_final_wave_with_nothing_collectable_leaves_the_end_marker_clean(pytester):
+    """The same wipe, one line later. When the LAST wave is the uncollectable one, the poisoned
+    baseline reaches `session-ended.json` instead of a done file — and the client synthesises a
+    junit out of that marker, so the invented `missing` row is what gets sent."""
+    pytester.makepyfile(test_suite=SUITE)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    feeder = _feed(control, [[A[0]], ["test_suite.py::TestA::test_renamed"]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done1 = json.loads((control / "wave-1.done.json").read_text(encoding="utf-8"))
+    assert done1["results"] == [] and done1["not_collected"], (
+        "the last wave was not the empty one this test needs: %r" % done1)
+    ended = json.loads((control / "session-ended.json").read_text(encoding="utf-8"))
+    assert ended["amended"] == [], (
+        "the end marker invented a verdict for a test that had already passed: %r" % ended)
+    result.assert_outcomes(passed=1)
+
+
+def test_a_real_correction_still_survives_an_uncollectable_wave_in_between(pytester):
+    """The other direction, so the fix above cannot be "stop amending". A class teardown that fails
+    at a boundary two waves later still has to be published: preserving the baseline is what makes
+    the correction expressible as a CHANGE rather than as a verdict conjured from nothing."""
+    pytester.makepyfile(test_suite=LATE_TEARDOWN)
+    control = pytester.path / "control"
+    control.mkdir()
+
+    ids = ["test_suite.py::TestA::test_1", "test_suite.py::TestA::test_2",
+           "test_suite.py::TestB::test_3"]
+    feeder = _feed(control, [[ids[0]], [ids[1]], ["test_suite.py::TestA::test_renamed"], [ids[2]]])
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), timeout=120)
+    feeder.join(timeout=30)
+
+    done = [json.loads((control / ("wave-%d.done.json" % n)).read_text(encoding="utf-8"))
+            for n in range(4)]
+
+    assert done[2]["results"] == [] and done[2]["not_collected"], (
+        "wave 2 was not the empty one this test needs: %r" % done[2])
+    # TestA's class ends when wave 3 asks for TestB, so that is where the correction appears --
+    # unchanged by the empty wave sitting between the test and its own teardown.
+    assert _rows(done[3], "amended") == {ids[1]: "error"}, (
+        "the deferred teardown failure was lost across the empty wave: %r" % done[3])
+    assert done[0]["amended"] == [] and done[1]["amended"] == []
+    result.assert_outcomes(passed=3, errors=1)
+
+
 def test_a_function_scoped_teardown_error_lands_in_ITS_OWN_wave(pytester):
     """Only class, module and session teardown genuinely has to wait for the next wave. The item's
     own function-scoped teardown does not, and vanilla runs it between two tests of the same class.
