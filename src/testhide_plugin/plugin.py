@@ -1480,6 +1480,20 @@ def pytest_runtestloop(session):
     if reporter is not None:
         reporter._runtestloop_entered = True
 
+    # One line, once, naming the two facts every "not collected" diagnosis needs: how much this
+    # session can see, and what its ids are relative to. It goes here rather than at configure time
+    # because collection has only just finished -- and a session whose scope or rootdir does not
+    # match the queue it is being given is the way this feature fails on a farm. Printed to stdout,
+    # which the agent streams into the build output.
+    try:
+        print('[testhide] persistent session ready: %d test(s) collected, rootdir %s'
+              % (len(session.items), getattr(session.config, 'rootdir', '?')))
+    except Exception:
+        # A diagnostic must never be load-bearing. This one sits between "we decided to serve
+        # waves" and actually serving them, so anything it raises would abandon the whole
+        # executor's assignments -- paying with the run for a line that only describes it.
+        pass
+
     _WaveRunner(control_dir, os.environ.get('TESTHIDE_SESSION_OWNER_PID')).run(session)
     return True
 
