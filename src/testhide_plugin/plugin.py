@@ -1085,21 +1085,37 @@ class _WaveRunner:
     def _verdict(self, nodeid):
         phases = self._wave_reports.get(nodeid) or {}
         duration = sum(getattr(r, 'duration', 0.0) or 0.0 for r in phases.values())
+        # A failure OUTRANKS a skip, and it is looked for FIRST — across every phase — because it
+        # can arrive in a phase that runs LATER than the one that skipped.
+        #
+        # One loop that returned on whichever came first read the phases in execution order, so a
+        # test that skipped in setup or in its body ended the scan before `teardown` was ever
+        # examined. pytest itself reports that case as "1 skipped, 1 error"; this reported it as
+        # `skipped` alone. And because the verdict was therefore unchanged from the one already
+        # published, `_amend` returned None, so the amendment channel could not carry it either:
+        # the teardown failure reached the backend by NO route at all.
+        #
+        # That is exactly the shape the feature exists to catch. A class fixture whose teardown
+        # raises — the Steam logout that did not happen — leaves the machine wedged for every test
+        # after it, and the test it happened under is precisely the one a suite is most likely to
+        # skip ("environment not ready").
         for when in ('setup', 'call', 'teardown'):
             rep = phases.get(when)
-            if rep is None:
-                continue
-            if rep.failed:
+            if rep is not None and rep.failed:
                 # A failure in setup or teardown is an ERROR in pytest's own vocabulary, and the
                 # backend distinguishes them: an error is a broken environment, a failure is a
                 # broken test, and conflating them sends the wrong node to triage.
                 return ('failed' if when == 'call' else 'error'), duration
-            if rep.skipped:
+
+        for when in ('setup', 'call', 'teardown'):
+            rep = phases.get(when)
+            if rep is not None and rep.skipped:
                 # Both phases, not setup alone. A `pytest.skip()` inside the test BODY produces a
                 # skipped CALL report, and reading only the setup phase reported it as passed —
                 # found by the test next to this one. A skip counted as a pass is the one direction
                 # that inflates a green build.
                 return 'skipped', duration
+
         return ('passed' if phases else 'missing'), duration
 
     # -- the loop -------------------------------------------------------------------------
@@ -1470,8 +1486,34 @@ def pytest_runtestloop(session):
     if not control_dir:
         return None
 
-    if session.config.option.collectonly:
+    opt = session.config.option
+
+    if getattr(opt, 'collectonly', False):
         return True
+
+    # `--setup-only` and `--setup-plan` reach here too, and pytest skips the `call` phase for both.
+    # `_verdict` then sees a passing SETUP report, no failure, and answers `passed` for every
+    # nodeid — without executing one test body. In session mode that is not a cosmetic wrong
+    # answer: PersistentSessionHost.StripReportFlags removes --report-xml from the session command,
+    # so these wave verdicts are the ONLY thing the backend gets.
+    #
+    # And it is fast. A fabricated `passed` costs about 0.2 ms, so against a FIFO queue this
+    # executor out-competes every healthy node exactly as the poisoned-session note below
+    # describes, and drains the whole suite into a green report nobody ran.
+    #
+    # The junit path has closed this door since it shipped (_session_executed_tests enumerates all
+    # three flags); the wave path — the only channel in session mode — was left open. Refusing
+    # LOUDLY rather than returning True: a silent no-op leaves the executor waiting on wave files
+    # that never appear until the idle timeout, which reads like a hung agent. UsageError ends the
+    # run with a non-zero code and a line naming the flag, so the batch is reclaimed and the build
+    # output says why.
+    for _dry_run_flag in ('setuponly', 'setupplan'):
+        if getattr(opt, _dry_run_flag, False):
+            raise pytest.UsageError(
+                'testhide: --%s cannot be used in a persistent session. pytest skips the call '
+                'phase under it, so every test would be reported as passed without running. '
+                'Remove it from the command, from pytest.ini addopts, and from PYTEST_ADDOPTS.'
+                % _dry_run_flag.replace('setup', 'setup-'))
 
     if session.testsfailed:
         # A collection error does NOT end a persistent session, which is the opposite of what a

@@ -1297,3 +1297,114 @@ def test_the_owner_check_is_the_first_statement_of_the_item_loop_body():
     assert getattr(first.value.func, 'attr', None) == '_abandon_if_orphaned', (
         "the owner check is not the first statement of the item loop; the break at the foot of the "
         "loop would skip it")
+
+
+# ----------------------------------------------------------- a verdict that hides a broken machine
+
+_SKIP_WITH_BROKEN_TEARDOWN = '''
+import pytest
+
+class TestA:
+    @pytest.fixture(scope="class", autouse=True)
+    def steam(self):
+        yield
+        raise RuntimeError("steam logout failed")
+
+    def test_1(self):
+        pytest.skip("environment not ready")
+
+class TestB:
+    def test_2(self): pass
+'''
+
+
+def _run_custom(pytester, suite, waves, *extra, timeout=120):
+    """run_waves, but for a suite this test writes itself."""
+    pytester.makepyfile(test_suite=suite)
+    control = pytester.path / "control"
+    control.mkdir()
+    feeder = _feed(control, waves)
+    result = pytester.runpytest_subprocess(
+        "test_suite.py", "--testhide-session-dir", str(control), *extra, timeout=timeout)
+    feeder.join(timeout=30)
+    done = []
+    for n in range(len(waves)):
+        p = control / ("wave-%d.done.json" % n)
+        done.append(json.loads(p.read_text(encoding="utf-8")) if p.exists() else None)
+    return result, done, control
+
+
+def test_a_teardown_error_under_a_SKIPPED_test_still_reaches_the_scheduler(pytester):
+    """The verdict scan read the phases in execution order and returned on whichever answer came
+    first, so a test that skipped never had its teardown looked at.
+
+    pytest itself calls this "1 skipped, 1 error". The wave protocol called it `skipped` and said
+    nothing else -- and because that verdict was unchanged from the one already published, the
+    amendment channel could not carry it either. The Steam logout that did not happen reached the
+    backend by no route at all, and the next test on that machine inherits the wedge.
+    """
+    result, done, _ = _run_custom(
+        pytester, _SKIP_WITH_BROKEN_TEARDOWN,
+        [["test_suite.py::TestA::test_1"], ["test_suite.py::TestB::test_2"]])
+
+    result.stdout.fnmatch_lines(["*RuntimeError: steam logout failed*"])
+    assert done[0] is not None and done[1] is not None, "a wave never reported"
+
+    # `skipped` is the RIGHT answer for wave 0: a class teardown runs at the class boundary, which
+    # is one wave later than the test that skipped -- that lateness is the whole reason the
+    # amendment channel exists. What was wrong is that the correction never followed.
+    assert [r.get("outcome") for r in (done[0].get("results") or [])] == ["skipped"]
+
+    amended = done[1].get("amended") or []
+    assert [(a.get("nodeid"), a.get("outcome")) for a in amended] == \
+        [("test_suite.py::TestA::test_1", "error")], (
+        "the teardown ERROR reached the scheduler by no route: wave 1 amended %r. The verdict scan "
+        "returned on the skip before it ever looked at the teardown phase, so the recomputed "
+        "verdict was UNCHANGED and _amend had nothing to report." % (amended,))
+
+
+def test_a_skip_with_a_clean_teardown_is_still_a_skip(pytester):
+    """The other half of the precedence, so the fix cannot be 'call everything an error'."""
+    suite = '''
+import pytest
+
+class TestA:
+    @pytest.fixture(scope="class", autouse=True)
+    def fine(self):
+        yield
+
+    def test_1(self):
+        pytest.skip("environment not ready")
+'''
+    _, done, _ = _run_custom(pytester, suite, [["test_suite.py::TestA::test_1"]])
+
+    assert [r.get("outcome") for r in (done[0].get("results") or [])] == ["skipped"]
+
+
+# ------------------------------------------------------------------ a dry run that fabricates green
+
+@pytest.mark.parametrize("flag", ["--setup-only", "--setup-plan"])
+def test_a_dry_run_flag_cannot_fabricate_passing_verdicts(pytester, flag):
+    """pytest skips the `call` phase under these, so the verdict scan saw a passing SETUP report,
+    no failure, and answered `passed` -- for tests that both assert False, in about 0.2 ms each.
+
+    In session mode that is the only channel there is: PersistentSessionHost.StripReportFlags takes
+    --report-xml out of the session command, so these wave verdicts are all the backend gets. And a
+    fabricated pass is FAST, so against a FIFO queue this executor out-competes every healthy node
+    and drains the suite into a green report nobody ran.
+
+    The junit path has refused all three dry-run flags since it shipped. This is the same door on
+    the channel that matters more.
+    """
+    suite = '''
+def test_alpha(): assert False
+def test_beta(): assert False
+'''
+    result, done, _ = _run_custom(
+        pytester, suite, [["test_suite.py::test_alpha"], ["test_suite.py::test_beta"]], flag)
+
+    assert result.ret != 0, "a dry-run session exited 0"
+    for d in done:
+        outcomes = [r.get("outcome") for r in ((d or {}).get("results") or [])]
+        assert "passed" not in outcomes, (
+            "%s produced a passing verdict without running a test body: %r" % (flag, outcomes))
