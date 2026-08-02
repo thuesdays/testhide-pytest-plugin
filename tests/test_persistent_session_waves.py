@@ -487,6 +487,14 @@ def test_a_wave_entirely_inside_a_broken_module_does_not_end_the_session(pyteste
         "a batch inside a broken module took the whole executor down")
     done2 = json.loads((control / "wave-2.done.json").read_text(encoding="utf-8"))
     assert [r["nodeid"] for r in done2["results"]] == A[2:]
+    # A broken module is the OTHER shape of a wave with nothing collectable, and it reaches the same
+    # baseline as a renamed nodeid does — but one branch later, so a change that re-wipes on this
+    # one alone would leave the renamed-nodeid test green. What that costs is here: wave 1 collected
+    # nothing, so test_2 is still held with its class teardown unrun, and a wiped baseline makes
+    # wave 2 amend an already-published `passed` to `missing`, which the client writes as <error>.
+    assert done2["amended"] == [], (
+        "a wave inside a broken module wiped the baseline and the previous wave's test was "
+        "re-published: %r" % done2["amended"])
     result.stdout.fnmatch_lines(["*COLLECTION FAILED*test_broken.py*"])
     assert "nodeids are relative to rootdir" not in result.stdout.str(), (
         "the operator was sent to look at rootdir for what is an import error")

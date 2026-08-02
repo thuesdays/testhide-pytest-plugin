@@ -1234,8 +1234,19 @@ class _WaveRunner:
                     # a _verdict over no phases at all: `missing`, for a test that had already
                     # reported `passed`. The client renders `missing` as <error> and the backend
                     # reads <error> as failed, which is the one direction this whole channel exists
-                    # to prevent. One renamed nodeid is enough to produce an empty wave, and the
-                    # wave is one test by default.
+                    # to prevent.
+                    #
+                    # Both halves of that sentence are true of the client shipping today, but the
+                    # row does not currently complete the trip: an empty wave produces no verdicts
+                    # at all, and on that the client retires the session instead of asking for the
+                    # wave that would carry the amendment — and the end-of-session marker it does
+                    # collect is dropped while the executor still holds unreported nodeids. That is
+                    # the client's policy of the day, not a property of this protocol, and it is
+                    # the opposite of the invented verdicts in _abandon_if_orphaned above, which
+                    # land in `results` and ARE sent. A row written here has to be true where it is
+                    # written; it may not lean on a reader that happens to throw it away. One
+                    # renamed nodeid is enough to produce an empty wave, and the wave is one test
+                    # by default.
                     self._wave_reports = {}
                     self._published = {}
                 for i, item in enumerate(items):
