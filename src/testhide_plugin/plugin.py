@@ -10,6 +10,7 @@ import time
 import socket
 import shutil
 import re
+import warnings
 from hashlib import md5
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -21,6 +22,52 @@ from .report_core import SCHEMA_VERSION, compute_fail_id
 
 # This global instance holds our active plugin, but only if it's enabled.
 plugin_instance = None
+
+
+class TestHideWarning(UserWarning):
+    """Something OPTIONAL failed and the run carries on without it.
+
+    Its own category so a suite that wants these silenced -- or escalated -- can name them without
+    touching every other UserWarning pytest emits.
+    """
+
+    # The product is called testhide, so the natural name for this collides with pytest's default
+    # `python_classes = Test*`: any module that imports the category -- a user's conftest silencing
+    # it, this repo's own tests -- gets `PytestCollectionWarning: cannot collect test class
+    # 'TestHideWarning' because it has a __init__ constructor`. A warning class that produces a
+    # warning by existing is not much of an improvement. `__test__ = False` is pytest's documented
+    # opt-out and keeps the name that says what it is.
+    __test__ = False
+
+
+def _warn(code, message):
+    """Report a non-fatal problem without ever becoming one.
+
+    This replaces `Config.warn(code, message)`, which pytest deprecated in 3.8 and REMOVED in 4.0.
+    The plugin requires pytest>=7, so every one of those calls raised
+    `AttributeError: 'Config' object has no attribute 'warn'` -- not sometimes, always.
+
+    What made that expensive rather than merely wrong is where they sat: all four were inside
+    `except` handlers, so the only way to reach one was for something to have gone wrong already.
+    The handler then threw on top of it. From `pytest_sessionstart` that escapes as INTERNALERROR
+    and takes the whole session with it -- so an unreachable JIRA, which this code was written to
+    shrug off, killed the run instead, and the traceback named the reporting line rather than the
+    connection.
+
+    `warnings.warn` is the documented replacement, but it is not unconditionally safe here: under
+    `filterwarnings = error` (or `-W error`) it RAISES, which would rebuild exactly the same trap in
+    a different shape. A handler whose whole contract is to degrade gracefully must not be able to
+    throw, so the emission is guarded and falls back to stderr.
+    """
+    text = '[testhide:%s] %s' % (code, message)
+    try:
+        warnings.warn(text, TestHideWarning, stacklevel=3)
+    except Exception:
+        # Includes the -W error case, where the warning IS the exception. Say it anyway.
+        try:
+            print(text, file=sys.stderr)
+        except Exception:
+            pass
 
 
 class FileLock:
@@ -95,21 +142,29 @@ class TesthidePlugin:
         """
         if not self.jira_enabled:
             return
-        
-        from jira import JIRA  # Lazy import to avoid dependency if not used
-        
-        for _ in range(3):  # Retry connection
+
+        for attempt in range(3):  # Retry connection
             try:
+                # Imported INSIDE the guard, not above the loop. `jira` is a declared dependency,
+                # but an import that fails here -- a broken wheel, a partially built venv, a
+                # transitive conflict -- is the same class of failure as an unreachable server, and
+                # it used to escape `pytest_sessionstart` as an INTERNALERROR. An optional
+                # integration that cannot load must switch itself off, not end the run.
+                from jira import JIRA
                 self.jira = JIRA(
                     self.config.option.jira_url,
                     basic_auth=(self.config.option.jira_username, self.config.option.jira_password)
                 )
                 return  # Success
             except Exception as e:
-                self.config.warn('JIRA_CONNECTION_ERROR', f"JIRA connection attempt failed: {e}")
-                time.sleep(3)
-        
-        self.config.warn('JIRA_CONNECTION_FAILED', "Could not establish JIRA connection after multiple retries.")
+                _warn('JIRA_CONNECTION_ERROR', f"JIRA connection attempt failed: {e}")
+                if attempt < 2:
+                    # BETWEEN attempts only. The sleep used to run after the last one too, which
+                    # waited three seconds for a retry that never came -- paid on the master node
+                    # of every build with a misconfigured JIRA, before a single test starts.
+                    time.sleep(3)
+
+        _warn('JIRA_CONNECTION_FAILED', "Could not establish JIRA connection after multiple retries.")
         self.jira_enabled = False  # Disable if connection failed
     
     def _get_issue_by_test_id(self, test_id: str):
@@ -122,7 +177,7 @@ class TesthidePlugin:
             issues = self.jira.search_issues(f'description ~ "{test_id}" ORDER BY updated')
             return issues[0] if issues else None
         except Exception as e:
-            self.config.warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for {test_id}: {e}")
+            _warn('JIRA_SEARCH_ERROR', f"Failed to search JIRA for {test_id}: {e}")
             return None
     
     def _log_failure_info(self, nodeid, fail_id, issue=None):
@@ -343,7 +398,7 @@ class TesthidePlugin:
                                 test_resolution = 'Known Issue'
                             failure_message = f'{test_resolution} {issue_id} {issue_type} [{issue_text}]'
                 except Exception as e:
-                    self.config.warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
+                    _warn('JIRA_MARKER_ERROR', f"JIRA marker failed: {e}")
             
             testcase_attrs = {
                 'classname': classname, 'name': name, 'file': str(filepath),
