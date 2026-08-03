@@ -147,3 +147,31 @@ def test_a_collection_error_is_reported_as_a_testcase(pytester):
     errors = root.findall(".//testcase/error")
     assert errors, "a collection error produced no <error> row"
     assert errors[0].get("message"), "<error> lost @message"
+
+
+def test_the_nodeid_is_stated_not_left_to_be_guessed(pytester):
+    """The backend prefers `<property name="nodeid">` and rebuilds the id from @classname + @name
+    when it is missing. That reconstruction cannot be right in general -- a display name is not a
+    nodeid -- and under TPS a rebuilt id that matches the wrong row hands one test's verdict to
+    another. The runner knows the real id; it belongs in the report."""
+    _, cases = _report(pytester)
+    for name, case in cases.items():
+        props = case.find("properties")
+        assert props is not None, "%s: no <properties>, so no nodeid" % name
+        by_name = {p.get("name"): p.get("value") for p in props.findall("property")}
+        assert "nodeid" in by_name, "%s: nodeid property missing" % name
+        assert by_name["nodeid"].startswith("test_suite.py::"), by_name["nodeid"]
+        assert name in by_name["nodeid"], by_name["nodeid"]
+
+
+def test_a_suite_supplied_nodeid_is_not_overwritten(pytester):
+    """The hook is the explicit override. A default that shadowed it would be worse than no
+    default -- the suite would be silently ignored."""
+    pytester.makeconftest('''
+        def pytest_testhide_get_test_case_properties(item, report):
+            return [("nodeid", "explicit::from::suite")]
+    ''')
+    _, cases = _report(pytester)
+    props = cases["test_passes"].find("properties")
+    vals = [p.get("value") for p in props.findall("property") if p.get("name") == "nodeid"]
+    assert vals == ["explicit::from::suite"], vals

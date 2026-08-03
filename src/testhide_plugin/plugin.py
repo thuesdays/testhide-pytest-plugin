@@ -459,6 +459,23 @@ class TesthidePlugin:
         
         all_properties = self.config.hook.pytest_testhide_get_test_case_properties(item=item, report=effective_report)
         flat_properties = [prop for sublist in all_properties for prop in sublist]
+
+        # The nodeid, stated rather than left to be guessed.
+        #
+        # The backend reads `<property name="nodeid">` first (test_provider.py, `_tc_property`)
+        # and, when it is absent, REBUILDS the id from @classname + @name. That reconstruction is
+        # lossy: a class path and a display name do not determine a nodeid, and under TPS -- where
+        # results come back per batch and are matched against the ids the scheduler handed out --
+        # a rebuilt id that matches the wrong row attributes one test's verdict to another. It is
+        # the id the runner actually executed, so it is the plugin's to report; every guess
+        # downstream exists only because this line was missing.
+        #
+        # Prepended, so a suite that also supplies one through the hook wins -- the hook is the
+        # explicit override and must not be shadowed by the default.
+        nodeid = getattr(item, 'nodeid', None)
+        if nodeid and not any(str(n) == 'nodeid' for n, _ in flat_properties):
+            flat_properties.insert(0, ('nodeid', nodeid))
+
         if flat_properties:
             properties_element = ET.SubElement(testcase, 'properties')
             for prop_name, prop_value in flat_properties:
